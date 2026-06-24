@@ -37,6 +37,29 @@ scli --workspace myteam channels
 
 `SLACK_TOKEN` wins unless you pass `--workspace`.
 
+### Auth methods
+
+`scli` accepts either:
+
+- **A token** — a normal `xoxp-…` user token (or `xoxb-…` bot token) from a Slack
+  app you install. Acts as your user (xoxp) and works everywhere.
+- **A browser session** — the `xoxc-…` token plus the `d` cookie (`xoxd-…`) copied
+  from your logged-in Slack web client (DevTools → Application → Local Storage /
+  Cookies). No app required; rides your existing login.
+
+```sh
+# token
+scli auth myteam xoxp-...
+
+# session (xoxc token + xoxd cookie)
+scli auth myteam xoxc-... --cookie xoxd-...
+# or via env
+export SLACK_TOKEN=xoxc-... SLACK_COOKIE=xoxd-...
+```
+
+An `xoxc-` token without a cookie is rejected. Note session tokens don't survive a
+Slack-side session refresh — re-copy them when they expire.
+
 ## Usage
 
 ```
