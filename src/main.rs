@@ -27,8 +27,17 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Save a workspace token to config: scli auth <name> <xoxp-token>
-    Auth { name: String, token: String },
+    /// Save a workspace to config: scli auth <name> <token> [--cookie xoxd-…]
+    ///
+    /// Use a normal token (xoxp-/xoxb-), or a browser-session token (xoxc-…)
+    /// together with --cookie <xoxd-…> copied from the Slack web client.
+    Auth {
+        name: String,
+        token: String,
+        /// The `d` cookie (xoxd-…) required for an xoxc- session token.
+        #[arg(long)]
+        cookie: Option<String>,
+    },
     /// List configured workspaces.
     Workspaces,
     /// Set the default workspace: scli default <name>
@@ -125,7 +134,11 @@ fn run() -> Result<()> {
 
     // Offline commands handled before building a client.
     match &cli.cmd {
-        Cmd::Auth { name, token } => return auth(name, token),
+        Cmd::Auth {
+            name,
+            token,
+            cookie,
+        } => return auth(name, token, cookie.as_deref()),
         Cmd::Workspaces => return workspaces(),
         Cmd::Default { name } => return set_default(name),
         Cmd::Draft {
@@ -193,6 +206,8 @@ fn read_text(arg: Option<String>) -> Result<String> {
 
 struct Client {
     token: String,
+    /// The `d` cookie value (without the `d=` prefix), required for xoxc- tokens.
+    cookie: Option<String>,
 }
 
 impl Client {
@@ -201,7 +216,8 @@ impl Client {
         if workspace.is_none() {
             if let Ok(token) = std::env::var("SLACK_TOKEN") {
                 if !token.is_empty() {
-                    return Ok(Client { token });
+                    let cookie = std::env::var("SLACK_COOKIE").ok().filter(|s| !s.is_empty());
+                    return Client::new(token, cookie);
                 }
             }
         }
@@ -217,29 +233,46 @@ impl Client {
                 },
             },
         };
-        let token = servers
+        let server = servers
             .and_then(|s| s.get(&name))
-            .and_then(|w| w.get("token"))
+            .ok_or_else(|| anyhow!("unknown workspace '{name}'"))?;
+        let token = server
+            .get("token")
             .and_then(Value::as_str)
-            .ok_or_else(|| anyhow!("unknown workspace '{name}'"))?
+            .ok_or_else(|| anyhow!("workspace '{name}' has no token"))?
             .to_string();
-        Ok(Client { token })
+        let cookie = server
+            .get("cookie")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        Client::new(token, cookie)
+    }
+
+    /// Build a client, validating that xoxc- session tokens carry a cookie.
+    fn new(token: String, cookie: Option<String>) -> Result<Client> {
+        if token.starts_with("xoxc-") && cookie.is_none() {
+            bail!("xoxc- session token needs a cookie: pass --cookie xoxd-… (or set SLACK_COOKIE)");
+        }
+        Ok(Client { token, cookie })
     }
 
     /// POST application/x-www-form-urlencoded (the Slack Web API convention).
     fn call(&self, method: &str, params: &[(&str, &str)]) -> Result<Value> {
-        let resp = ureq::post(&format!("{API}/{method}"))
-            .set("Authorization", &format!("Bearer {}", self.token))
-            .send_form(params);
-        read(resp, method)
+        let mut req = ureq::post(&format!("{API}/{method}"))
+            .set("Authorization", &format!("Bearer {}", self.token));
+        if let Some(c) = &self.cookie {
+            req = req.set("Cookie", &format!("d={c}"));
+        }
+        read(req.send_form(params), method)
     }
 
-    /// GET with a Bearer header (used for downloading url_private).
+    /// GET an authenticated file URL (url_private), incl. the session cookie.
     fn get_bytes(&self, url: &str) -> Result<Vec<u8>> {
-        let resp = ureq::get(url)
-            .set("Authorization", &format!("Bearer {}", self.token))
-            .call()
-            .with_context(|| format!("GET {url}"))?;
+        let mut req = ureq::get(url).set("Authorization", &format!("Bearer {}", self.token));
+        if let Some(c) = &self.cookie {
+            req = req.set("Cookie", &format!("d={c}"));
+        }
+        let resp = req.call().with_context(|| format!("GET {url}"))?;
         let mut buf = Vec::new();
         resp.into_reader()
             .read_to_end(&mut buf)
@@ -655,12 +688,19 @@ fn save_config(v: &Value) -> Result<()> {
     Ok(())
 }
 
-fn auth(name: &str, token: &str) -> Result<()> {
+fn auth(name: &str, token: &str, cookie: Option<&str>) -> Result<()> {
+    if token.starts_with("xoxc-") && cookie.is_none() {
+        bail!("xoxc- session token needs --cookie xoxd-… (copy the `d` cookie from the Slack web client)");
+    }
     let mut cfg = load_config()?;
     if !cfg["servers"].is_object() {
         cfg["servers"] = serde_json::json!({});
     }
-    cfg["servers"][name] = serde_json::json!({ "token": token });
+    let mut entry = serde_json::json!({ "token": token });
+    if let Some(c) = cookie {
+        entry["cookie"] = Value::String(c.to_string());
+    }
+    cfg["servers"][name] = entry;
     if !cfg["default"].is_string() {
         cfg["default"] = Value::String(name.to_string());
     }
