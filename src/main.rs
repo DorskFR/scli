@@ -108,6 +108,13 @@ enum Cmd {
     /// Reminders (DEPRECATED by Slack since 2023 — may stop working).
     #[command(subcommand)]
     Remind(Remind),
+
+    /// Update scli in place to the latest GitHub release.
+    Update {
+        /// Only report whether a newer version exists; don't install.
+        #[arg(long)]
+        check: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -131,6 +138,14 @@ fn main() {
 
 fn run() -> Result<()> {
     let cli = Cli::parse();
+
+    // `update` manages the binary itself; no Slack client and no update notice.
+    if let Cmd::Update { check } = cli.cmd {
+        return self_update(check);
+    }
+
+    // Best-effort "newer version available" notice on every other command.
+    update_notice();
 
     // Offline commands handled before building a client.
     match &cli.cmd {
@@ -179,8 +194,12 @@ fn run() -> Result<()> {
         Cmd::React { channel, ts, emoji } => c.react(&channel, &ts, &emoji),
         Cmd::Remind(Remind::List) => c.remind_list(),
         Cmd::Remind(Remind::Add { text, at }) => c.remind_add(&text, &at),
-        // offline commands already handled
-        Cmd::Auth { .. } | Cmd::Workspaces | Cmd::Default { .. } | Cmd::Draft { .. } => {
+        // offline / self-managed commands already handled
+        Cmd::Auth { .. }
+        | Cmd::Workspaces
+        | Cmd::Default { .. }
+        | Cmd::Draft { .. }
+        | Cmd::Update { .. } => {
             unreachable!()
         }
     }
@@ -733,4 +752,217 @@ fn set_default(name: &str) -> Result<()> {
     save_config(&cfg)?;
     println!("default = {name}");
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Self-update: `scli update` + a once-a-day "newer version available" notice.
+// Releases live at github.com/dorskFR/scli with assets `scli-{os}-{arch}` and a
+// `SHA256SUMS` file (see .github/workflows/release.yml).
+// ---------------------------------------------------------------------------
+
+const LATEST_API: &str = "https://api.github.com/repos/dorskFR/scli/releases/latest";
+const UA: &str = concat!("scli/", env!("CARGO_PKG_VERSION"));
+
+/// The release-asset name for the host platform, e.g. `scli-linux-x86_64`.
+fn asset_name() -> Result<String> {
+    let os = match std::env::consts::OS {
+        "linux" => "linux",
+        "macos" => "darwin",
+        other => bail!("unsupported OS '{other}' (linux/macos only)"),
+    };
+    let arch = match std::env::consts::ARCH {
+        "x86_64" => "x86_64",
+        "aarch64" => "aarch64",
+        other => bail!("unsupported arch '{other}' (x86_64/aarch64 only)"),
+    };
+    Ok(format!("scli-{os}-{arch}"))
+}
+
+/// Parse a `vX.Y.Z` (or `X.Y.Z`) tag into a comparable tuple. Missing/extra parts
+/// are tolerated (defaulting to 0 / ignored).
+fn parse_ver(s: &str) -> (u64, u64, u64) {
+    let s = s.trim().trim_start_matches('v');
+    let mut it = s
+        .split(['.', '-', '+'])
+        .map(|p| p.parse::<u64>().unwrap_or(0));
+    (
+        it.next().unwrap_or(0),
+        it.next().unwrap_or(0),
+        it.next().unwrap_or(0),
+    )
+}
+
+/// Fetch the latest release JSON from GitHub (short timeout, sends a User-Agent).
+fn fetch_latest() -> Result<Value> {
+    let resp = ureq::get(LATEST_API)
+        .set("User-Agent", UA)
+        .set("Accept", "application/vnd.github+json")
+        .timeout(std::time::Duration::from_secs(10))
+        .call();
+    match resp {
+        Ok(r) => r.into_json().context("parsing release JSON"),
+        Err(ureq::Error::Status(code, r)) => {
+            let txt = r.into_string().unwrap_or_default();
+            bail!("GitHub API HTTP {code}: {txt}")
+        }
+        Err(e) => Err(e).context("querying GitHub releases"),
+    }
+}
+
+fn self_update(check_only: bool) -> Result<()> {
+    let current = env!("CARGO_PKG_VERSION");
+    let want = asset_name()?;
+    let rel = fetch_latest()?;
+    let tag = rel["tag_name"]
+        .as_str()
+        .ok_or_else(|| anyhow!("release has no tag_name"))?;
+
+    if parse_ver(tag) <= parse_ver(current) {
+        println!("scli is up to date (v{current})");
+        return Ok(());
+    }
+
+    if check_only {
+        println!("{tag} available (you have v{current}) — run 'scli update'");
+        return Ok(());
+    }
+
+    eprintln!("updating scli v{current} -> {tag} ({want})");
+
+    // Locate the asset and the checksums file in the release.
+    let assets = rel["assets"].as_array().cloned().unwrap_or_default();
+    let url_of = |name: &str| -> Option<String> {
+        assets
+            .iter()
+            .find(|a| a["name"].as_str() == Some(name))
+            .and_then(|a| a["browser_download_url"].as_str())
+            .map(str::to_string)
+    };
+    let bin_url = url_of(&want).ok_or_else(|| anyhow!("release {tag} has no asset '{want}'"))?;
+    let sums_url =
+        url_of("SHA256SUMS").ok_or_else(|| anyhow!("release {tag} has no SHA256SUMS file"))?;
+
+    // Download the new binary and verify its checksum before touching anything.
+    let bytes = download(&bin_url)?;
+    let sums = String::from_utf8(download(&sums_url)?).context("SHA256SUMS not UTF-8")?;
+    let want_sum = sums
+        .lines()
+        .find_map(|l| {
+            let (sum, file) = l.split_once("  ").or_else(|| l.split_once(' '))?;
+            (file.trim() == want).then(|| sum.trim().to_lowercase())
+        })
+        .ok_or_else(|| anyhow!("no checksum for '{want}' in SHA256SUMS"))?;
+    let got_sum = {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(&bytes);
+        h.finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    };
+    if got_sum != want_sum {
+        bail!("checksum mismatch for {want}: expected {want_sum}, got {got_sum} (aborting)");
+    }
+
+    // Atomically swap the running binary: write a sibling temp file, then rename.
+    let exe = std::env::current_exe().context("locating current executable")?;
+    let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
+    let dir = exe
+        .parent()
+        .ok_or_else(|| anyhow!("executable has no parent dir"))?;
+    let tmp = dir.join(format!(".scli-update-{}", std::process::id()));
+    std::fs::write(&tmp, &bytes).with_context(|| {
+        format!(
+            "writing {} (need write access to {})",
+            tmp.display(),
+            dir.display()
+        )
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))
+            .context("setting executable bit")?;
+    }
+    if let Err(e) = std::fs::rename(&tmp, &exe) {
+        std::fs::remove_file(&tmp).ok();
+        return Err(e).with_context(|| {
+            format!(
+                "replacing {} (different filesystem? install manually)",
+                exe.display()
+            )
+        });
+    }
+    println!("updated to {tag}");
+    Ok(())
+}
+
+/// Download a URL to bytes (follows redirects, sends a User-Agent).
+fn download(url: &str) -> Result<Vec<u8>> {
+    let resp = ureq::get(url)
+        .set("User-Agent", UA)
+        .timeout(std::time::Duration::from_secs(60))
+        .call()
+        .with_context(|| format!("downloading {url}"))?;
+    let mut buf = Vec::new();
+    resp.into_reader()
+        .read_to_end(&mut buf)
+        .context("reading download body")?;
+    Ok(buf)
+}
+
+/// Best-effort, non-blocking-feeling notice: at most once/24h, ask GitHub for the
+/// latest tag, cache it, and print to stderr if it's newer. Never errors out.
+fn update_notice() {
+    if std::env::var("SCLI_NO_UPDATE_CHECK")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+    {
+        return;
+    }
+    let current = env!("CARGO_PKG_VERSION");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let cache = update_cache_path();
+
+    // Read cache; if checked within the last day, just use the cached tag.
+    let cached: Value = cache
+        .as_ref()
+        .ok()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or(Value::Null);
+    let last = cached["checked"].as_u64().unwrap_or(0);
+
+    let latest = if now.saturating_sub(last) < 86_400 {
+        cached["latest"].as_str().map(str::to_string)
+    } else {
+        let tag = fetch_latest()
+            .ok()
+            .and_then(|r| r["tag_name"].as_str().map(str::to_string));
+        if let (Ok(p), Some(t)) = (&cache, &tag) {
+            if let Some(parent) = p.parent() {
+                std::fs::create_dir_all(parent).ok();
+            }
+            std::fs::write(
+                p,
+                serde_json::json!({ "checked": now, "latest": t }).to_string(),
+            )
+            .ok();
+        }
+        tag
+    };
+
+    if let Some(t) = latest {
+        if parse_ver(&t) > parse_ver(current) {
+            eprintln!("scli: {t} available (you have v{current}) — run 'scli update'");
+        }
+    }
+}
+
+fn update_cache_path() -> Result<PathBuf> {
+    Ok(config_path()?.parent().unwrap().join("update-check.json"))
 }
