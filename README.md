@@ -74,6 +74,7 @@ scli send   <channel> [text|-] [--thread ts] [-f FILE ...]
 scli react  <channel> <ts> <emoji>
 scli remind list                                     # DEPRECATED by Slack
 scli remind add "text" --at "in 30 minutes"          # DEPRECATED by Slack
+scli update [--check]                                # self-update to latest release
 ```
 
 `<channel>` accepts a raw ID (`C…/G…/D…`), `#name`, or `@user` (→ DM).
@@ -98,6 +99,12 @@ scli send '#release' 'logs attached' -f build.log
   2023 and may stop working without notice; `scli` warns on use.
 - File uploads use the current `files.getUploadURLExternal` +
   `files.completeUploadExternal` flow (`files.upload` is deprecated).
+- **Self-update**: `scli update` replaces the running binary in place with the
+  matching asset from the latest GitHub release (Linux/macOS, x86_64/aarch64),
+  verifying its `SHA256SUMS` checksum first. `scli update --check` only reports
+  whether a newer version exists. Every other command prints a one-line
+  *"newer version available"* notice to **stderr** (so piped stdout stays clean),
+  at most once per 24h; set `SCLI_NO_UPDATE_CHECK=1` to disable it.
 
 ## Agent setup
 
