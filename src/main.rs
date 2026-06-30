@@ -416,6 +416,13 @@ impl Client {
                 let nf = m["files"].as_array().map(|a| a.len()).unwrap_or(0);
                 tags.push_str(&format!(" [files:{nf}]"));
             }
+            if let Some(na) = m["attachments"]
+                .as_array()
+                .map(|a| a.len())
+                .filter(|n| *n > 0)
+            {
+                tags.push_str(&format!(" [attachments:{na}]"));
+            }
             println!("{ts}  {user}  {text}{tags}");
         }
     }
@@ -435,9 +442,38 @@ impl Client {
             .cloned()
             .ok_or_else(|| anyhow!("message not found"))?;
         let files = msg["files"].as_array().cloned().unwrap_or_default();
-        if files.is_empty() {
-            println!("no files");
+        let attachments = msg["attachments"].as_array().cloned().unwrap_or_default();
+        if files.is_empty() && attachments.is_empty() {
+            println!("no files or attachments");
             return Ok(());
+        }
+        // Link/rich attachments (unfurls, bot/app cards): content lives in the
+        // attachments array, not files. Print it in compact, grep-friendly form.
+        // Downloading applies to uploaded files only; attachments are always shown.
+        for a in &attachments {
+            let title = a["title"].as_str().unwrap_or("");
+            let link = a["title_link"]
+                .as_str()
+                .or(a["from_url"].as_str())
+                .unwrap_or("");
+            let pretext = a["pretext"].as_str().unwrap_or("").replace('\n', " ");
+            let text = a["text"].as_str().unwrap_or("").replace('\n', " ");
+            let mut parts: Vec<String> = Vec::new();
+            if !pretext.is_empty() {
+                parts.push(pretext);
+            }
+            if !title.is_empty() || !link.is_empty() {
+                parts.push(format!("{title}\t{link}").trim().to_string());
+            }
+            if !text.is_empty() {
+                parts.push(text);
+            }
+            for f in a["fields"].as_array().into_iter().flatten() {
+                let t = f["title"].as_str().unwrap_or("");
+                let val = f["value"].as_str().unwrap_or("").replace('\n', " ");
+                parts.push(format!("{t}: {val}").trim().to_string());
+            }
+            println!("attachment\t{}", parts.join(" | "));
         }
         for f in &files {
             let name = f["name"].as_str().unwrap_or("file");

@@ -68,7 +68,7 @@ scli users                                           # ID<TAB>NAME<TAB>REAL_NAME
 scli read   <channel> [-l N]                         # recent messages
 scli thread <channel> <ts>                           # thread replies
 scli dm     <@user> [-l N]                           # DM history
-scli files  <channel> <ts> [--download DIR]          # list/fetch attachments
+scli files  <channel> <ts> [--download DIR]          # list/fetch uploaded files + link attachments
 scli draft  <channel> [text|-] [--thread ts]         # compose locally, no send
 scli send   <channel> [text|-] [--thread ts] [-f FILE ...]
 scli react  <channel> <ts> <emoji>
@@ -99,6 +99,12 @@ scli send '#release' 'logs attached' -f build.log
   2023 and may stop working without notice; `scli` warns on use.
 - File uploads use the current `files.getUploadURLExternal` +
   `files.completeUploadExternal` flow (`files.upload` is deprecated).
+- **Attachments vs files**: Slack messages carry two distinct things — uploaded
+  `files` and the `attachments` array (link unfurls, bot/app rich cards whose
+  body lives in `title`/`title_link`/`text`/`fields`). `read`/`thread`/`dm` tag
+  messages with `[files:N]` and `[attachments:N]`; `scli files` lists both,
+  printing each link attachment as a compact `attachment\t…` line. `--download`
+  fetches uploaded files only.
 - **Self-update**: `scli update` replaces the running binary in place with the
   matching asset from the latest GitHub release (Linux/macOS, x86_64/aarch64),
   verifying its `SHA256SUMS` checksum first. `scli update --check` only reports
