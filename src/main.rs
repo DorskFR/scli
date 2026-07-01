@@ -49,9 +49,21 @@ enum Cmd {
         /// public | private | dm | mpim | all
         #[arg(long, default_value = "all")]
         r#type: String,
+        /// Optional case-insensitive substring filter (client-side).
+        filter: Option<String>,
     },
     /// List users as `ID\tNAME\tREAL_NAME`.
-    Users,
+    Users {
+        /// Optional case-insensitive substring filter (client-side).
+        filter: Option<String>,
+    },
+
+    /// Search cached channels AND users by case-insensitive substring.
+    ///
+    /// Prints `chan|user\tID\tNAME` — the quick way to find an id.
+    Ls { query: String },
+    /// Force-refresh the local id<->name cache now.
+    Sync,
 
     /// Read recent messages in a channel.
     Read {
@@ -197,8 +209,10 @@ fn run() -> Result<()> {
     let c = Client::resolve(cli.workspace.as_deref())?;
 
     match cli.cmd {
-        Cmd::Channels { r#type } => c.channels(&r#type),
-        Cmd::Users => c.users(),
+        Cmd::Channels { r#type, filter } => c.channels(&r#type, filter.as_deref()),
+        Cmd::Users { filter } => c.users(filter.as_deref()),
+        Cmd::Ls { query } => c.ls(&query),
+        Cmd::Sync => c.sync(),
         Cmd::Read { channel, limit } => c.read(&channel, limit),
         Cmd::Thread { channel, ts } => c.thread(&channel, &ts),
         Cmd::Dm { user, limit } => c.dm(&user, limit),
@@ -225,7 +239,13 @@ fn run() -> Result<()> {
         | Cmd::Completions { .. } => {
             unreachable!()
         }
-    }
+    }?;
+    Ok(())
+}
+
+/// Case-insensitive substring test.
+fn contains_ci(haystack: &str, needle: &str) -> bool {
+    haystack.to_lowercase().contains(&needle.to_lowercase())
 }
 
 /// Read message text from an arg, or stdin when omitted / "-".
@@ -250,6 +270,8 @@ struct Client {
     token: String,
     /// The `d` cookie value (without the `d=` prefix), required for xoxc- tokens.
     cookie: Option<String>,
+    /// Cache key for this workspace: config name, or `env-<hash>` for SLACK_TOKEN.
+    workspace: String,
 }
 
 impl Client {
@@ -259,7 +281,9 @@ impl Client {
             if let Ok(token) = std::env::var("SLACK_TOKEN") {
                 if !token.is_empty() {
                     let cookie = std::env::var("SLACK_COOKIE").ok().filter(|s| !s.is_empty());
-                    return Client::new(token, cookie);
+                    // Synthetic, token-scoped key so distinct env tokens don't share a cache.
+                    let key = format!("env-{}", short_hash(&token));
+                    return Client::new(token, cookie, key);
                 }
             }
         }
@@ -287,15 +311,19 @@ impl Client {
             .get("cookie")
             .and_then(Value::as_str)
             .map(str::to_string);
-        Client::new(token, cookie)
+        Client::new(token, cookie, name)
     }
 
     /// Build a client, validating that xoxc- session tokens carry a cookie.
-    fn new(token: String, cookie: Option<String>) -> Result<Client> {
+    fn new(token: String, cookie: Option<String>, workspace: String) -> Result<Client> {
         if token.starts_with("xoxc-") && cookie.is_none() {
             bail!("xoxc- session token needs a cookie: pass --cookie xoxd-… (or set SLACK_COOKIE)");
         }
-        Ok(Client { token, cookie })
+        Ok(Client {
+            token,
+            cookie,
+            workspace,
+        })
     }
 
     /// POST application/x-www-form-urlencoded (the Slack Web API convention).
@@ -324,7 +352,7 @@ impl Client {
 
     // --- channels / users -------------------------------------------------
 
-    fn channels(&self, kind: &str) -> Result<()> {
+    fn channels(&self, kind: &str, filter: Option<&str>) -> Result<()> {
         let types = match kind {
             "public" => "public_channel",
             "private" => "private_channel",
@@ -351,8 +379,10 @@ impl Client {
                     .as_str()
                     .map(str::to_string)
                     .unwrap_or_else(|| format!("dm:{}", ch["user"].as_str().unwrap_or("?")));
-                println!("{id}\t{name}");
-                n += 1;
+                if filter.map(|q| contains_ci(&name, q)).unwrap_or(true) {
+                    println!("{id}\t{name}");
+                    n += 1;
+                }
             }
             cursor = next_cursor(&v);
             if cursor.is_empty() {
@@ -365,7 +395,7 @@ impl Client {
         Ok(())
     }
 
-    fn users(&self) -> Result<()> {
+    fn users(&self, filter: Option<&str>) -> Result<()> {
         let mut cursor = String::new();
         loop {
             let v = self.call("users.list", &[("limit", "200"), ("cursor", &cursor)])?;
@@ -376,7 +406,12 @@ impl Client {
                 let id = u["id"].as_str().unwrap_or("");
                 let name = u["name"].as_str().unwrap_or("");
                 let real = u["profile"]["real_name"].as_str().unwrap_or("");
-                println!("{id}\t{name}\t{real}");
+                if filter
+                    .map(|q| contains_ci(name, q) || contains_ci(real, q))
+                    .unwrap_or(true)
+                {
+                    println!("{id}\t{name}\t{real}");
+                }
             }
             cursor = next_cursor(&v);
             if cursor.is_empty() {
@@ -623,6 +658,118 @@ impl Client {
         Ok(())
     }
 
+    // --- cache ------------------------------------------------------------
+
+    /// id<->name maps for this workspace: fresh cache when available, otherwise
+    /// refetch from the API and rewrite. `force` always refetches.
+    fn maps(&self, force: bool) -> Result<Maps> {
+        if !force {
+            if let Some(m) = load_maps(&self.workspace).filter(Maps::is_fresh) {
+                return Ok(m);
+            }
+        }
+        let m = self.fetch_maps()?;
+        save_maps(&self.workspace, &m).ok();
+        Ok(m)
+    }
+
+    /// Page channels (public+private) and users into a fresh `Maps`.
+    fn fetch_maps(&self) -> Result<Maps> {
+        let mut channels = Vec::new();
+        let mut cursor = String::new();
+        loop {
+            let v = self.call(
+                "conversations.list",
+                &[
+                    ("types", "public_channel,private_channel"),
+                    ("limit", "200"),
+                    ("exclude_archived", "true"),
+                    ("cursor", &cursor),
+                ],
+            )?;
+            for ch in v["channels"].as_array().unwrap_or(&vec![]).iter() {
+                if let (Some(id), Some(name)) = (ch["id"].as_str(), ch["name"].as_str()) {
+                    channels.push(Chan {
+                        id: id.to_string(),
+                        name: name.to_string(),
+                    });
+                }
+            }
+            cursor = next_cursor(&v);
+            if cursor.is_empty() {
+                break;
+            }
+        }
+
+        let mut users = Vec::new();
+        let mut cursor = String::new();
+        loop {
+            let v = self.call("users.list", &[("limit", "200"), ("cursor", &cursor)])?;
+            for u in v["members"].as_array().unwrap_or(&vec![]).iter() {
+                if u["deleted"].as_bool().unwrap_or(false) {
+                    continue;
+                }
+                let Some(id) = u["id"].as_str() else { continue };
+                users.push(Usr {
+                    id: id.to_string(),
+                    name: u["name"].as_str().unwrap_or("").to_string(),
+                    real: u["profile"]["real_name"].as_str().unwrap_or("").to_string(),
+                    display: u["profile"]["display_name"]
+                        .as_str()
+                        .unwrap_or("")
+                        .to_string(),
+                });
+            }
+            cursor = next_cursor(&v);
+            if cursor.is_empty() {
+                break;
+            }
+        }
+
+        Ok(Maps {
+            fetched: now_secs(),
+            channels,
+            users,
+        })
+    }
+
+    /// `scli sync` — force-refresh the cache now.
+    fn sync(&self) -> Result<()> {
+        let m = self.maps(true)?;
+        println!(
+            "synced {}: {} channels, {} users",
+            self.workspace,
+            m.channels.len(),
+            m.users.len()
+        );
+        Ok(())
+    }
+
+    /// `scli ls <substr>` — substring search across cached channels AND users.
+    fn ls(&self, query: &str) -> Result<()> {
+        let m = self.maps(false)?;
+        let mut n = 0;
+        for c in &m.channels {
+            if contains_ci(&c.name, query) {
+                println!("chan\t{}\t{}", c.id, c.name);
+                n += 1;
+            }
+        }
+        for u in &m.users {
+            if contains_ci(&u.name, query)
+                || contains_ci(&u.real, query)
+                || contains_ci(&u.display, query)
+            {
+                println!("user\t{}\t{}", u.id, u.name);
+                n += 1;
+            }
+        }
+        if n == 0 {
+            println!("no match for '{query}'");
+        }
+        Ok(())
+    }
+
     // --- resolution helpers ----------------------------------------------
 
     /// Accept a raw ID, a #name, or a @user (resolved to a DM channel).
@@ -636,25 +783,10 @@ impl Client {
         if is_channel_id(name) {
             return Ok(name.to_string());
         }
-        // look it up by name
-        let mut cursor = String::new();
-        loop {
-            let v = self.call(
-                "conversations.list",
-                &[
-                    ("types", "public_channel,private_channel"),
-                    ("limit", "200"),
-                    ("cursor", &cursor),
-                ],
-            )?;
-            for ch in v["channels"].as_array().unwrap_or(&vec![]).iter() {
-                if ch["name"].as_str() == Some(name) {
-                    return Ok(ch["id"].as_str().unwrap_or(name).to_string());
-                }
-            }
-            cursor = next_cursor(&v);
-            if cursor.is_empty() {
-                break;
+        // Cache-first: try fresh cache, and on a miss refetch once before failing.
+        for force in [false, true] {
+            if let Some(c) = self.maps(force)?.channels.iter().find(|c| c.name == name) {
+                return Ok(c.id.clone());
             }
         }
         bail!("channel '{s}' not found")
@@ -665,23 +797,130 @@ impl Client {
         if name.starts_with('U') || name.starts_with('W') {
             return Ok(name.to_string());
         }
-        let mut cursor = String::new();
-        loop {
-            let v = self.call("users.list", &[("limit", "200"), ("cursor", &cursor)])?;
-            for u in v["members"].as_array().unwrap_or(&vec![]).iter() {
-                if u["name"].as_str() == Some(name)
-                    || u["profile"]["display_name"].as_str() == Some(name)
-                {
-                    return Ok(u["id"].as_str().unwrap_or(name).to_string());
-                }
-            }
-            cursor = next_cursor(&v);
-            if cursor.is_empty() {
-                break;
+        for force in [false, true] {
+            if let Some(u) = self
+                .maps(force)?
+                .users
+                .iter()
+                .find(|u| u.name == name || u.display == name)
+            {
+                return Ok(u.id.clone());
             }
         }
         bail!("user '{s}' not found")
     }
+}
+
+// ---------------------------------------------------------------------------
+// Local id<->name cache: ~/.cache/scli/<workspace>.json (respects XDG_CACHE_HOME).
+// ---------------------------------------------------------------------------
+
+const CACHE_TTL_SECS: u64 = 300;
+
+struct Chan {
+    id: String,
+    name: String,
+}
+
+struct Usr {
+    id: String,
+    name: String,
+    real: String,
+    display: String,
+}
+
+struct Maps {
+    fetched: u64,
+    channels: Vec<Chan>,
+    users: Vec<Usr>,
+}
+
+impl Maps {
+    fn is_fresh(&self) -> bool {
+        now_secs().saturating_sub(self.fetched) < CACHE_TTL_SECS
+    }
+
+    fn to_json(&self) -> Value {
+        serde_json::json!({
+            "fetched": self.fetched,
+            "channels": self.channels.iter()
+                .map(|c| serde_json::json!({ "id": c.id, "name": c.name }))
+                .collect::<Vec<_>>(),
+            "users": self.users.iter()
+                .map(|u| serde_json::json!({
+                    "id": u.id, "name": u.name, "real": u.real, "display": u.display
+                }))
+                .collect::<Vec<_>>(),
+        })
+    }
+
+    fn from_json(v: &Value) -> Maps {
+        let s = |x: &Value, k: &str| x[k].as_str().unwrap_or("").to_string();
+        Maps {
+            fetched: v["fetched"].as_u64().unwrap_or(0),
+            channels: v["channels"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|c| Chan {
+                    id: s(c, "id"),
+                    name: s(c, "name"),
+                })
+                .collect(),
+            users: v["users"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|u| Usr {
+                    id: s(u, "id"),
+                    name: s(u, "name"),
+                    real: s(u, "real"),
+                    display: s(u, "display"),
+                })
+                .collect(),
+        }
+    }
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// First 8 hex chars of sha256(input) — a short, stable, non-reversible key.
+fn short_hash(input: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(input.as_bytes());
+    h.finalize()
+        .iter()
+        .take(4)
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+fn cache_path(workspace: &str) -> Result<PathBuf> {
+    let base = std::env::var("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|_| std::env::var("HOME").map(|h| PathBuf::from(h).join(".cache")))
+        .context("no HOME/XDG_CACHE_HOME")?;
+    Ok(base.join("scli").join(format!("{workspace}.json")))
+}
+
+fn load_maps(workspace: &str) -> Option<Maps> {
+    let path = cache_path(workspace).ok()?;
+    let s = std::fs::read_to_string(path).ok()?;
+    let v: Value = serde_json::from_str(&s).ok()?;
+    Some(Maps::from_json(&v))
+}
+
+fn save_maps(workspace: &str, m: &Maps) -> Result<()> {
+    let path = cache_path(workspace)?;
+    std::fs::create_dir_all(path.parent().unwrap()).context("creating cache dir")?;
+    std::fs::write(&path, serde_json::to_string(&m.to_json())?).context("writing cache")?;
+    Ok(())
 }
 
 fn is_channel_id(s: &str) -> bool {
