@@ -7,7 +7,8 @@ use std::io::Read as _;
 use std::path::PathBuf;
 
 use anyhow::{anyhow, bail, Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
+use clap_complete::Shell;
 use serde_json::Value;
 
 const API: &str = "https://slack.com/api";
@@ -115,6 +116,14 @@ enum Cmd {
         #[arg(long)]
         check: bool,
     },
+
+    /// Print a shell completion script: scli completions <bash|zsh|fish|powershell|elvish>
+    ///
+    /// e.g. `scli completions fish > ~/.config/fish/completions/scli.fish`
+    Completions {
+        /// Shell to generate completions for.
+        shell: Shell,
+    },
 }
 
 #[derive(Subcommand)]
@@ -131,7 +140,12 @@ enum Remind {
 
 fn main() {
     if let Err(e) = run() {
-        eprintln!("error: {e:#}");
+        // Bold red "error:" via anstream: color is auto-stripped when stderr is
+        // not a TTY or NO_COLOR/CLICOLOR say so (agent-safe).
+        let red = anstyle::Style::new()
+            .fg_color(Some(anstyle::AnsiColor::Red.into()))
+            .bold();
+        anstream::eprintln!("{red}error:{red:#} {e:#}");
         std::process::exit(1);
     }
 }
@@ -142,6 +156,14 @@ fn run() -> Result<()> {
     // `update` manages the binary itself; no Slack client and no update notice.
     if let Cmd::Update { check } = cli.cmd {
         return self_update(check);
+    }
+
+    // `completions` emits a shell script to stdout; no Slack client, no notice.
+    if let Cmd::Completions { shell } = cli.cmd {
+        let mut cmd = Cli::command();
+        let name = cmd.get_name().to_string();
+        clap_complete::generate(shell, &mut cmd, name, &mut std::io::stdout());
+        return Ok(());
     }
 
     // Best-effort "newer version available" notice on every other command.
@@ -199,7 +221,8 @@ fn run() -> Result<()> {
         | Cmd::Workspaces
         | Cmd::Default { .. }
         | Cmd::Draft { .. }
-        | Cmd::Update { .. } => {
+        | Cmd::Update { .. }
+        | Cmd::Completions { .. } => {
             unreachable!()
         }
     }
@@ -994,7 +1017,10 @@ fn update_notice() {
 
     if let Some(t) = latest {
         if parse_ver(&t) > parse_ver(current) {
-            eprintln!("scli: {t} available (you have v{current}) — run 'scli update'");
+            let dim = anstyle::Style::new().dimmed();
+            anstream::eprintln!(
+                "{dim}scli: {t} available (you have v{current}) — run 'scli update'{dim:#}"
+            );
         }
     }
 }

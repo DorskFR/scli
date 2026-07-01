@@ -1,13 +1,16 @@
 [package]
 name = "scli"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2021"
 description = "Token-frugal Slack CLI for coding agents"
 license = "MIT"
 
 [dependencies]
+anstream = "0.6"
+anstyle = "1"
 anyhow = "1"
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "color", "suggestions", "wrap_help"] }
+clap_complete = "4"
 serde_json = "1"
 sha2 = "0.10"
 ureq = { version = "2", features = ["json"] }
