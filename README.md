@@ -8,7 +8,7 @@ an LLM (or `grep`) can read it cheaply.
 
 ```sh
 # prebuilt binary
-curl -L https://github.com/dorskFR/scli/releases/latest/download/scli-linux-x86_64 -o scli
+curl -L https://github.com/dorskFR/scli/releases/latest/download/scli-linux-amd64 -o scli
 chmod +x scli && sudo mv scli /usr/local/bin/
 
 # or from source
@@ -75,6 +75,7 @@ scli read thread   <channel> <ts>                        # thread replies
 scli read dm       <@user> [-l N]                        # DM history
 scli read files    <channel> <ts> [--download DIR]       # list/fetch uploaded files + link attachments
 scli read draft    <channel> [text|-] [--thread ts]      # compose locally, no send
+scli read ls       <query>                               # search cached channels+users
 
 # write tier (changes Slack or local creds)
 scli write send   <channel> [text|-] [--thread ts] [-f FILE ...]
@@ -83,11 +84,8 @@ scli write remind list                                   # DEPRECATED by Slack
 scli write remind add "text" --at "in 30 minutes"        # DEPRECATED by Slack
 scli write auth    <name> <token> [--cookie xoxd-…]      # save a workspace
 scli write default <name>                                # set default workspace
-
-# utility (tier-free)
-scli ls <query>                                          # search cached channels+users
-scli sync                                                # refresh id<->name cache
-scli update [--check]                                    # self-update to latest release
+scli write sync                                          # refresh id<->name cache
+scli write update [--check]                              # self-update to latest release
 ```
 
 `<channel>` accepts a raw ID (`C…/G…/D…`), `#name`, or `@user` (→ DM).
@@ -119,9 +117,9 @@ scli write send '#release' 'logs attached' -f build.log
   read files` lists both,
   printing each link attachment as a compact `attachment\t…` line. `--download`
   fetches uploaded files only.
-- **Self-update**: `scli update` replaces the running binary in place with the
-  matching asset from the latest GitHub release (Linux/macOS, x86_64/aarch64),
-  verifying its `SHA256SUMS` checksum first. `scli update --check` only reports
+- **Self-update**: `scli write update` replaces the running binary in place with the
+  matching asset from the latest GitHub release (Linux amd64/arm64, macOS arm64),
+  verifying its `SHA256SUMS` checksum first. `scli write update --check` only reports
   whether a newer version exists. Every other command prints a one-line
   *"newer version available"* notice to **stderr** (so piped stdout stays clean),
   at most once per 24h; set `SCLI_NO_UPDATE_CHECK=1` to disable it.
