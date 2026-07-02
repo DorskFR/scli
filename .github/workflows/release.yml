@@ -77,3 +77,18 @@ jobs:
           files: |
             dist/scli-*
             dist/SHA256SUMS
+      # Rolling `latest` release: a moving git tag + release carrying the same
+      # assets, so consumers (the cctui worker image) can pull
+      # releases/download/latest/... and always get the newest build. Delete then
+      # recreate so the tag moves to this commit.
+      - name: publish rolling latest release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete latest --repo "$GITHUB_REPOSITORY" --cleanup-tag --yes || true
+          gh release create latest \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "latest (${TAG})" \
+            --notes "Rolling pointer to the most recent release (${TAG})." \
+            dist/scli-* dist/SHA256SUMS
