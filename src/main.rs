@@ -36,20 +36,6 @@ enum Cmd {
     #[command(subcommand)]
     Write(WriteCmd),
 
-    /// Search cached channels AND users by case-insensitive substring.
-    ///
-    /// Prints `chan|user\tID\tNAME` — the quick way to find an id.
-    Ls { query: String },
-    /// Force-refresh the local id<->name cache now.
-    Sync,
-
-    /// Update scli in place to the latest GitHub release.
-    Update {
-        /// Only report whether a newer version exists; don't install.
-        #[arg(long)]
-        check: bool,
-    },
-
     /// Print a shell completion script: scli completions <bash|zsh|fish|powershell|elvish>
     ///
     /// e.g. `scli completions fish > ~/.config/fish/completions/scli.fish`
@@ -77,6 +63,11 @@ enum ReadCmd {
     },
     /// List configured workspaces.
     Workspaces,
+
+    /// Search cached channels AND users by case-insensitive substring.
+    ///
+    /// Prints `chan|user\tID\tNAME` — the quick way to find an id.
+    Ls { query: String },
 
     /// Read recent messages in a channel.
     Messages {
@@ -153,6 +144,16 @@ enum WriteCmd {
     },
     /// Set the default workspace: scli write default <name>
     Default { name: String },
+
+    /// Force-refresh the local id<->name cache now.
+    Sync,
+
+    /// Update scli in place to the latest GitHub release.
+    Update {
+        /// Only report whether a newer version exists; don't install.
+        #[arg(long)]
+        check: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -183,7 +184,7 @@ fn run() -> Result<()> {
     let cli = Cli::parse();
 
     // `update` manages the binary itself; no Slack client and no update notice.
-    if let Cmd::Update { check } = cli.cmd {
+    if let Cmd::Write(WriteCmd::Update { check }) = cli.cmd {
         return self_update(check);
     }
 
@@ -226,8 +227,6 @@ fn run() -> Result<()> {
     let c = Client::resolve(cli.workspace.as_deref())?;
 
     match cli.cmd {
-        Cmd::Ls { query } => c.ls(&query),
-        Cmd::Sync => c.sync(),
         Cmd::Read(r) => match r {
             ReadCmd::Channels { r#type, filter } => c.channels(&r#type, filter.as_deref()),
             ReadCmd::Users { filter } => c.users(filter.as_deref()),
@@ -239,6 +238,7 @@ fn run() -> Result<()> {
                 ts,
                 download,
             } => c.files(&channel, &ts, download),
+            ReadCmd::Ls { query } => c.ls(&query),
             // offline reads already handled
             ReadCmd::Workspaces | ReadCmd::Draft { .. } => unreachable!(),
         },
@@ -252,11 +252,14 @@ fn run() -> Result<()> {
             WriteCmd::React { channel, ts, emoji } => c.react(&channel, &ts, &emoji),
             WriteCmd::Remind(Remind::List) => c.remind_list(),
             WriteCmd::Remind(Remind::Add { text, at }) => c.remind_add(&text, &at),
+            WriteCmd::Sync => c.sync(),
             // offline writes already handled
-            WriteCmd::Auth { .. } | WriteCmd::Default { .. } => unreachable!(),
+            WriteCmd::Auth { .. } | WriteCmd::Default { .. } | WriteCmd::Update { .. } => {
+                unreachable!()
+            }
         },
         // self-managed commands already handled
-        Cmd::Update { .. } | Cmd::Completions { .. } => unreachable!(),
+        Cmd::Completions { .. } => unreachable!(),
     }?;
     Ok(())
 }
@@ -751,7 +754,7 @@ impl Client {
         })
     }
 
-    /// `scli sync` — force-refresh the cache now.
+    /// `scli write sync` — force-refresh the cache now.
     fn sync(&self) -> Result<()> {
         let m = self.maps(true)?;
         println!(
@@ -763,7 +766,7 @@ impl Client {
         Ok(())
     }
 
-    /// `scli ls <substr>` — substring search across cached channels AND users.
+    /// `scli read ls <substr>` — substring search across cached channels AND users.
     fn ls(&self, query: &str) -> Result<()> {
         let m = self.maps(false)?;
         let mut n = 0;
@@ -1071,7 +1074,7 @@ fn set_default(name: &str) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// Self-update: `scli update` + a once-a-day "newer version available" notice.
+// Self-update: `scli write update` + a once-a-day "newer version available" notice.
 // Releases live at github.com/dorskFR/scli with assets `scli-{os}-{arch}` and a
 // `SHA256SUMS` file (see .github/workflows/release.yml).
 // ---------------------------------------------------------------------------
@@ -1079,7 +1082,7 @@ fn set_default(name: &str) -> Result<()> {
 const LATEST_API: &str = "https://api.github.com/repos/dorskFR/scli/releases/latest";
 const UA: &str = concat!("scli/", env!("CARGO_PKG_VERSION"));
 
-/// The release-asset name for the host platform, e.g. `scli-linux-x86_64`.
+/// The release-asset name for the host platform, e.g. `scli-linux-amd64`.
 fn asset_name() -> Result<String> {
     let os = match std::env::consts::OS {
         "linux" => "linux",
@@ -1087,10 +1090,14 @@ fn asset_name() -> Result<String> {
         other => bail!("unsupported OS '{other}' (linux/macos only)"),
     };
     let arch = match std::env::consts::ARCH {
-        "x86_64" => "x86_64",
-        "aarch64" => "aarch64",
+        "x86_64" => "amd64",
+        "aarch64" => "arm64",
         other => bail!("unsupported arch '{other}' (x86_64/aarch64 only)"),
     };
+    // macOS Intel is not published; only Apple Silicon (arm64) darwin builds exist.
+    if os == "darwin" && arch == "amd64" {
+        bail!("no macOS Intel (darwin-amd64) build is published; use Apple Silicon");
+    }
     Ok(format!("scli-{os}-{arch}"))
 }
 
@@ -1139,7 +1146,7 @@ fn self_update(check_only: bool) -> Result<()> {
     }
 
     if check_only {
-        println!("{tag} available (you have v{current}) — run 'scli update'");
+        println!("{tag} available (you have v{current}) — run 'scli write update'");
         return Ok(());
     }
 
@@ -1276,7 +1283,7 @@ fn update_notice() {
         if parse_ver(&t) > parse_ver(current) {
             let dim = anstyle::Style::new().dimmed();
             anstream::eprintln!(
-                "{dim}scli: {t} available (you have v{current}) — run 'scli update'{dim:#}"
+                "{dim}scli: {t} available (you have v{current}) — run 'scli write update'{dim:#}"
             );
         }
     }
