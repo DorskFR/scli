@@ -29,10 +29,10 @@ and `reminders:read`/`reminders:write` if you use reminders).
 export SLACK_TOKEN=xoxp-...
 
 # or store it (multi-workspace, ~/.config/scli/config.json, mode 0600)
-scli auth myteam xoxp-...
-scli workspaces
-scli default myteam
-scli --workspace myteam channels
+scli write auth myteam xoxp-...
+scli read workspaces
+scli write default myteam
+scli --workspace myteam read channels
 ```
 
 `SLACK_TOKEN` wins unless you pass `--workspace`.
@@ -49,10 +49,10 @@ scli --workspace myteam channels
 
 ```sh
 # token
-scli auth myteam xoxp-...
+scli write auth myteam xoxp-...
 
 # session (xoxc token + xoxd cookie)
-scli auth myteam xoxc-... --cookie xoxd-...
+scli write auth myteam xoxc-... --cookie xoxd-...
 # or via env
 export SLACK_TOKEN=xoxc-... SLACK_COOKIE=xoxd-...
 ```
@@ -62,19 +62,32 @@ Slack-side session refresh — re-copy them when they expire.
 
 ## Usage
 
+Every Slack operation lives under an explicit `read` or `write` tier, so a
+sandbox can gate access with two prefixes (`scli read` / `scli write`).
+
 ```
-scli channels [--type public|private|dm|mpim|all]   # ID<TAB>NAME mapping
-scli users                                           # ID<TAB>NAME<TAB>REAL_NAME
-scli read   <channel> [-l N]                         # recent messages
-scli thread <channel> <ts>                           # thread replies
-scli dm     <@user> [-l N]                           # DM history
-scli files  <channel> <ts> [--download DIR]          # list/fetch uploaded files + link attachments
-scli draft  <channel> [text|-] [--thread ts]         # compose locally, no send
-scli send   <channel> [text|-] [--thread ts] [-f FILE ...]
-scli react  <channel> <ts> <emoji>
-scli remind list                                     # DEPRECATED by Slack
-scli remind add "text" --at "in 30 minutes"          # DEPRECATED by Slack
-scli update [--check]                                # self-update to latest release
+# read tier (nothing mutates Slack)
+scli read channels [--type public|private|dm|mpim|all]   # ID<TAB>NAME mapping
+scli read users                                          # ID<TAB>NAME<TAB>REAL_NAME
+scli read workspaces                                     # configured workspaces
+scli read messages <channel> [-l N]                      # recent messages
+scli read thread   <channel> <ts>                        # thread replies
+scli read dm       <@user> [-l N]                        # DM history
+scli read files    <channel> <ts> [--download DIR]       # list/fetch uploaded files + link attachments
+scli read draft    <channel> [text|-] [--thread ts]      # compose locally, no send
+
+# write tier (changes Slack or local creds)
+scli write send   <channel> [text|-] [--thread ts] [-f FILE ...]
+scli write react  <channel> <ts> <emoji>
+scli write remind list                                   # DEPRECATED by Slack
+scli write remind add "text" --at "in 30 minutes"        # DEPRECATED by Slack
+scli write auth    <name> <token> [--cookie xoxd-…]      # save a workspace
+scli write default <name>                                # set default workspace
+
+# utility (tier-free)
+scli ls <query>                                          # search cached channels+users
+scli sync                                                # refresh id<->name cache
+scli update [--check]                                    # self-update to latest release
 ```
 
 `<channel>` accepts a raw ID (`C…/G…/D…`), `#name`, or `@user` (→ DM).
@@ -84,11 +97,11 @@ stdin when omitted or given as `-`.
 ## Examples
 
 ```sh
-scli send '#general' 'deploy finished ✅'
-echo "$REPORT" | scli send @alice -
-scli react '#general' 1700000000.000100 thumbsup
-scli read '#general' -l 50 | grep deploy
-scli send '#release' 'logs attached' -f build.log
+scli write send '#general' 'deploy finished ✅'
+echo "$REPORT" | scli write send @alice -
+scli write react '#general' 1700000000.000100 thumbsup
+scli read messages '#general' -l 50 | grep deploy
+scli write send '#release' 'logs attached' -f build.log
 ```
 
 ## Notes
@@ -101,8 +114,9 @@ scli send '#release' 'logs attached' -f build.log
   `files.completeUploadExternal` flow (`files.upload` is deprecated).
 - **Attachments vs files**: Slack messages carry two distinct things — uploaded
   `files` and the `attachments` array (link unfurls, bot/app rich cards whose
-  body lives in `title`/`title_link`/`text`/`fields`). `read`/`thread`/`dm` tag
-  messages with `[files:N]` and `[attachments:N]`; `scli files` lists both,
+  body lives in `title`/`title_link`/`text`/`fields`). `read messages`/`read
+  thread`/`read dm` tag messages with `[files:N]` and `[attachments:N]`; `scli
+  read files` lists both,
   printing each link attachment as a compact `attachment\t…` line. `--download`
   fetches uploaded files only.
 - **Self-update**: `scli update` replaces the running binary in place with the
@@ -116,9 +130,10 @@ scli send '#release' 'logs attached' -f build.log
 
 Drop this into your `CLAUDE.md` so an agent uses `scli` instead of a Slack MCP:
 
-> Use the `scli` CLI for Slack. `SLACK_TOKEN` is set. Read with `scli read/thread/dm`,
-> map names with `scli channels`/`scli users`, post with `scli send`, react with
-> `scli react`. Output is `ID<TAB>...` lines — cheap to parse.
+> Use the `scli` CLI for Slack. `SLACK_TOKEN` is set. Every operation is under a
+> `read` or `write` tier. Read with `scli read messages/thread/dm`, map names with
+> `scli read channels`/`scli read users`, post with `scli write send`, react with
+> `scli write react`. Output is `ID<TAB>...` lines — cheap to parse.
 
 ## License
 

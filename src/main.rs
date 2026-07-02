@@ -28,22 +28,40 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Save a workspace to config: scli auth <name> <token> [--cookie xoxd-…]
-    ///
-    /// Use a normal token (xoxp-/xoxb-), or a browser-session token (xoxc-…)
-    /// together with --cookie <xoxd-…> copied from the Slack web client.
-    Auth {
-        name: String,
-        token: String,
-        /// The `d` cookie (xoxd-…) required for an xoxc- session token.
-        #[arg(long)]
-        cookie: Option<String>,
-    },
-    /// List configured workspaces.
-    Workspaces,
-    /// Set the default workspace: scli default <name>
-    Default { name: String },
+    /// Read-only Slack operations (safe to expose broadly).
+    #[command(subcommand)]
+    Read(ReadCmd),
 
+    /// State-changing Slack operations (posting, reacting, credentials).
+    #[command(subcommand)]
+    Write(WriteCmd),
+
+    /// Search cached channels AND users by case-insensitive substring.
+    ///
+    /// Prints `chan|user\tID\tNAME` — the quick way to find an id.
+    Ls { query: String },
+    /// Force-refresh the local id<->name cache now.
+    Sync,
+
+    /// Update scli in place to the latest GitHub release.
+    Update {
+        /// Only report whether a newer version exists; don't install.
+        #[arg(long)]
+        check: bool,
+    },
+
+    /// Print a shell completion script: scli completions <bash|zsh|fish|powershell|elvish>
+    ///
+    /// e.g. `scli completions fish > ~/.config/fish/completions/scli.fish`
+    Completions {
+        /// Shell to generate completions for.
+        shell: Shell,
+    },
+}
+
+/// Read-only tier: nothing here mutates Slack state.
+#[derive(Subcommand)]
+enum ReadCmd {
     /// List channels as `ID\tNAME` (public, private, DMs, group DMs).
     Channels {
         /// public | private | dm | mpim | all
@@ -57,24 +75,19 @@ enum Cmd {
         /// Optional case-insensitive substring filter (client-side).
         filter: Option<String>,
     },
-
-    /// Search cached channels AND users by case-insensitive substring.
-    ///
-    /// Prints `chan|user\tID\tNAME` — the quick way to find an id.
-    Ls { query: String },
-    /// Force-refresh the local id<->name cache now.
-    Sync,
+    /// List configured workspaces.
+    Workspaces,
 
     /// Read recent messages in a channel.
-    Read {
+    Messages {
         /// Channel ID (C…/G…/D…) or #name / @user.
         channel: String,
         #[arg(short, long, default_value_t = 20)]
         limit: u32,
     },
-    /// Read a thread's replies: scli thread <channel> <ts>
+    /// Read a thread's replies: scli read thread <channel> <ts>
     Thread { channel: String, ts: String },
-    /// Read a DM with a user: scli dm <@user|Uxxxx>
+    /// Read a DM with a user: scli read dm <@user|Uxxxx>
     Dm {
         user: String,
         #[arg(short, long, default_value_t = 20)]
@@ -98,6 +111,11 @@ enum Cmd {
         #[arg(long)]
         thread: Option<String>,
     },
+}
+
+/// Write tier: everything here changes Slack (or local credential) state.
+#[derive(Subcommand)]
+enum WriteCmd {
     /// Send a message; optionally in a thread and/or with file attachments.
     Send {
         channel: String,
@@ -110,7 +128,7 @@ enum Cmd {
         file: Vec<PathBuf>,
     },
 
-    /// Add a reaction: scli react <channel> <ts> <emoji>
+    /// Add a reaction: scli write react <channel> <ts> <emoji>
     React {
         channel: String,
         ts: String,
@@ -122,20 +140,19 @@ enum Cmd {
     #[command(subcommand)]
     Remind(Remind),
 
-    /// Update scli in place to the latest GitHub release.
-    Update {
-        /// Only report whether a newer version exists; don't install.
-        #[arg(long)]
-        check: bool,
-    },
-
-    /// Print a shell completion script: scli completions <bash|zsh|fish|powershell|elvish>
+    /// Save a workspace to config: scli write auth <name> <token> [--cookie xoxd-…]
     ///
-    /// e.g. `scli completions fish > ~/.config/fish/completions/scli.fish`
-    Completions {
-        /// Shell to generate completions for.
-        shell: Shell,
+    /// Use a normal token (xoxp-/xoxb-), or a browser-session token (xoxc-…)
+    /// together with --cookie <xoxd-…> copied from the Slack web client.
+    Auth {
+        name: String,
+        token: String,
+        /// The `d` cookie (xoxd-…) required for an xoxc- session token.
+        #[arg(long)]
+        cookie: Option<String>,
     },
+    /// Set the default workspace: scli write default <name>
+    Default { name: String },
 }
 
 #[derive(Subcommand)]
@@ -183,18 +200,18 @@ fn run() -> Result<()> {
 
     // Offline commands handled before building a client.
     match &cli.cmd {
-        Cmd::Auth {
+        Cmd::Write(WriteCmd::Auth {
             name,
             token,
             cookie,
-        } => return auth(name, token, cookie.as_deref()),
-        Cmd::Workspaces => return workspaces(),
-        Cmd::Default { name } => return set_default(name),
-        Cmd::Draft {
+        }) => return auth(name, token, cookie.as_deref()),
+        Cmd::Read(ReadCmd::Workspaces) => return workspaces(),
+        Cmd::Write(WriteCmd::Default { name }) => return set_default(name),
+        Cmd::Read(ReadCmd::Draft {
             channel,
             text,
             thread,
-        } => {
+        }) => {
             let body = read_text(text.clone())?;
             let mut p = serde_json::json!({ "channel": channel, "text": body });
             if let Some(t) = thread {
@@ -209,36 +226,37 @@ fn run() -> Result<()> {
     let c = Client::resolve(cli.workspace.as_deref())?;
 
     match cli.cmd {
-        Cmd::Channels { r#type, filter } => c.channels(&r#type, filter.as_deref()),
-        Cmd::Users { filter } => c.users(filter.as_deref()),
         Cmd::Ls { query } => c.ls(&query),
         Cmd::Sync => c.sync(),
-        Cmd::Read { channel, limit } => c.read(&channel, limit),
-        Cmd::Thread { channel, ts } => c.thread(&channel, &ts),
-        Cmd::Dm { user, limit } => c.dm(&user, limit),
-        Cmd::Files {
-            channel,
-            ts,
-            download,
-        } => c.files(&channel, &ts, download),
-        Cmd::Send {
-            channel,
-            text,
-            thread,
-            file,
-        } => c.send(&channel, read_text(text)?, thread, &file),
-        Cmd::React { channel, ts, emoji } => c.react(&channel, &ts, &emoji),
-        Cmd::Remind(Remind::List) => c.remind_list(),
-        Cmd::Remind(Remind::Add { text, at }) => c.remind_add(&text, &at),
-        // offline / self-managed commands already handled
-        Cmd::Auth { .. }
-        | Cmd::Workspaces
-        | Cmd::Default { .. }
-        | Cmd::Draft { .. }
-        | Cmd::Update { .. }
-        | Cmd::Completions { .. } => {
-            unreachable!()
-        }
+        Cmd::Read(r) => match r {
+            ReadCmd::Channels { r#type, filter } => c.channels(&r#type, filter.as_deref()),
+            ReadCmd::Users { filter } => c.users(filter.as_deref()),
+            ReadCmd::Messages { channel, limit } => c.read(&channel, limit),
+            ReadCmd::Thread { channel, ts } => c.thread(&channel, &ts),
+            ReadCmd::Dm { user, limit } => c.dm(&user, limit),
+            ReadCmd::Files {
+                channel,
+                ts,
+                download,
+            } => c.files(&channel, &ts, download),
+            // offline reads already handled
+            ReadCmd::Workspaces | ReadCmd::Draft { .. } => unreachable!(),
+        },
+        Cmd::Write(w) => match w {
+            WriteCmd::Send {
+                channel,
+                text,
+                thread,
+                file,
+            } => c.send(&channel, read_text(text)?, thread, &file),
+            WriteCmd::React { channel, ts, emoji } => c.react(&channel, &ts, &emoji),
+            WriteCmd::Remind(Remind::List) => c.remind_list(),
+            WriteCmd::Remind(Remind::Add { text, at }) => c.remind_add(&text, &at),
+            // offline writes already handled
+            WriteCmd::Auth { .. } | WriteCmd::Default { .. } => unreachable!(),
+        },
+        // self-managed commands already handled
+        Cmd::Update { .. } | Cmd::Completions { .. } => unreachable!(),
     }?;
     Ok(())
 }
