@@ -23,7 +23,8 @@ docker run --rm -e SLACK_TOKEN ghcr.io/dorskfr/scli channels
 `scli` needs a Slack **user token** (`xoxp-…`) from a Slack app with the scopes
 you intend to use (`channels:read`, `channels:history`, `users:read`,
 `chat:write`, `reactions:read`, `reactions:write`, `files:read`, `files:write`,
-and `reminders:read`/`reminders:write` if you use reminders).
+`search:read` for `read search`, and `reminders:read`/`reminders:write` if you
+use reminders).
 
 ```sh
 export SLACK_TOKEN=xoxp-...
@@ -76,6 +77,7 @@ scli read dm       <@user> [-l N]                        # DM history
 scli read files    <channel> <ts> [--download DIR]       # list/fetch uploaded files + link attachments
 scli read draft    <channel> [text|-] [--thread ts]      # compose locally, no send
 scli read ls       <query>                               # search cached channels+users
+scli read search   <query> [-l N] [--sort score|timestamp]  # full-text message search
 
 # write tier (changes Slack or local creds)
 scli write send   <channel> [text|-] [--thread ts] [-f FILE ...]
@@ -104,6 +106,15 @@ scli write send '#release' 'logs attached' -f build.log
 
 ## Notes
 
+- **Search** (`read search`) is Slack's server-side full-text search
+  (`search.messages`). The query passes through verbatim, so Slack modifiers work:
+  `in:#chan`, `from:@user`, `before:`/`after:`/`on:`, `has:link`, `"exact phrase"`.
+  Output is `CHANNEL_ID<TAB>CHANNEL<TAB>TS<TAB>USER<TAB>TEXT`, so a hit feeds
+  straight into `scli read thread <CHANNEL_ID> <TS>`. Requires the `search:read`
+  scope and a **user** token (xoxp-/xoxc-; bot tokens can't search). The endpoint
+  is rate-limited (Tier 2, ~20 req/min); scli never sleeps or retries — on 429 it
+  exits non-zero with `rate limited — retry after Ns` so a calling agent knows to
+  wait.
 - **Drafts** aren't a public Slack API — `scli draft` composes a payload locally;
   pipe it into `scli send` to actually post.
 - **Reminders** (`reminders.add`/`reminders.list`) were deprecated by Slack in
@@ -130,8 +141,11 @@ Drop this into your `CLAUDE.md` so an agent uses `scli` instead of a Slack MCP:
 
 > Use the `scli` CLI for Slack. `SLACK_TOKEN` is set. Every operation is under a
 > `read` or `write` tier. Read with `scli read messages/thread/dm`, map names with
-> `scli read channels`/`scli read users`, post with `scli write send`, react with
-> `scli write react`. Output is `ID<TAB>...` lines — cheap to parse.
+> `scli read channels`/`scli read users`, search message content with
+> `scli read search '<query>'` (Slack modifiers like `in:#chan from:@user` work;
+> on a `rate limited — retry after Ns` error, wait that long before retrying),
+> post with `scli write send`, react with `scli write react`. Output is
+> `ID<TAB>...` lines — cheap to parse.
 
 ## License
 

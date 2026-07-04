@@ -94,6 +94,21 @@ enum ReadCmd {
         download: Option<PathBuf>,
     },
 
+    /// Full-text message search (Slack `search.messages`; needs the `search:read`
+    /// scope on a user token).
+    ///
+    /// The query passes through verbatim, so Slack modifiers work as-is:
+    /// `in:#chan`, `from:@user`, `before:`/`after:`/`on:`, `has:link`, "exact phrase".
+    /// Prints `CHANNEL_ID\tCHANNEL\tTS\tUSER\tTEXT` — a hit's ts feeds `read thread`.
+    Search {
+        query: String,
+        #[arg(short, long, default_value_t = 20)]
+        limit: u32,
+        /// Result order: score | timestamp
+        #[arg(long, default_value = "score")]
+        sort: String,
+    },
+
     /// Compose a message locally without sending (prints the payload).
     Draft {
         channel: String,
@@ -239,6 +254,7 @@ fn run() -> Result<()> {
                 download,
             } => c.files(&channel, &ts, download),
             ReadCmd::Ls { query } => c.ls(&query),
+            ReadCmd::Search { query, limit, sort } => c.search(&query, limit, &sort),
             // offline reads already handled
             ReadCmd::Workspaces | ReadCmd::Draft { .. } => unreachable!(),
         },
@@ -504,6 +520,42 @@ impl Client {
             }
             println!("{ts}  {user}  {text}{tags}");
         }
+    }
+
+    /// `scli read search` — server-side full-text search via `search.messages`.
+    /// Tier-2 rate limit (~20 req/min): a 429 is surfaced, never retried here.
+    fn search(&self, query: &str, limit: u32, sort: &str) -> Result<()> {
+        if !matches!(sort, "score" | "timestamp") {
+            bail!("unknown sort '{sort}' (score|timestamp)");
+        }
+        // search.messages caps count at 100 per page; one page keeps us frugal
+        // with the Tier-2 budget, like `read messages` does with its one call.
+        let count = limit.clamp(1, 100).to_string();
+        let v = self.call(
+            "search.messages",
+            &[("query", query), ("count", &count), ("sort", sort)],
+        )?;
+        let matches = v["messages"]["matches"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        if matches.is_empty() {
+            println!("no matches");
+            return Ok(());
+        }
+        for m in &matches {
+            let chan_id = m["channel"]["id"].as_str().unwrap_or("");
+            let chan = m["channel"]["name"].as_str().unwrap_or("");
+            let ts = m["ts"].as_str().unwrap_or("");
+            let user = m["username"].as_str().or(m["user"].as_str()).unwrap_or("?");
+            let text = m["text"].as_str().unwrap_or("").replace('\n', " ");
+            println!("{chan_id}\t{chan}\t{ts}\t{user}\t{text}");
+        }
+        let total = v["messages"]["total"].as_i64().unwrap_or(0);
+        if total > matches.len() as i64 {
+            eprintln!("showing {} of {total} matches (raise -l, or narrow the query)", matches.len());
+        }
+        Ok(())
     }
 
     // --- files ------------------------------------------------------------
@@ -978,6 +1030,15 @@ fn reactions_str(m: &Value) -> String {
 fn read(resp: Result<ureq::Response, ureq::Error>, method: &str) -> Result<Value> {
     let body = match resp {
         Ok(r) => r,
+        // Rate limits are the caller's problem by design: no sleeping or retrying
+        // in here — report Slack's Retry-After so an agent knows how long to wait.
+        Err(ureq::Error::Status(429, r)) => {
+            let wait = r
+                .header("retry-after")
+                .map(|s| format!("{s}s"))
+                .unwrap_or_else(|| "a bit".into());
+            bail!("{method}: rate limited (HTTP 429) — retry after {wait}");
+        }
         Err(ureq::Error::Status(code, r)) => {
             let txt = r.into_string().unwrap_or_default();
             bail!("{method}: HTTP {code}: {txt}");
@@ -989,6 +1050,9 @@ fn read(resp: Result<ureq::Response, ureq::Error>, method: &str) -> Result<Value
         .with_context(|| format!("{method}: invalid JSON"))?;
     if !v["ok"].as_bool().unwrap_or(false) {
         let err = v["error"].as_str().unwrap_or("unknown_error");
+        if err == "ratelimited" {
+            bail!("{method}: rate limited — wait ~60s before retrying");
+        }
         bail!("{method}: {err}");
     }
     Ok(v)
