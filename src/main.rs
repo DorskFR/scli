@@ -553,7 +553,10 @@ impl Client {
         }
         let total = v["messages"]["total"].as_i64().unwrap_or(0);
         if total > matches.len() as i64 {
-            eprintln!("showing {} of {total} matches (raise -l, or narrow the query)", matches.len());
+            eprintln!(
+                "showing {} of {total} matches (raise -l, or narrow the query)",
+                matches.len()
+            );
         }
         Ok(())
     }
