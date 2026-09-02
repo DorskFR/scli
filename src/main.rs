@@ -22,6 +22,9 @@ struct Cli {
     /// Named workspace from config to use (overrides default).
     #[arg(long, global = true)]
     workspace: Option<String>,
+    /// Read commands: emit one raw Slack JSON record per line (NDJSON) instead of text.
+    #[arg(long, global = true)]
+    json: bool,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -295,7 +298,7 @@ fn run() -> Result<()> {
             token,
             cookie,
         }) => return auth(name, token, cookie.as_deref()),
-        Cmd::Read(ReadCmd::Workspaces) => return workspaces(),
+        Cmd::Read(ReadCmd::Workspaces) => return workspaces(cli.json),
         Cmd::Write(WriteCmd::Default { name }) => return set_default(name),
         Cmd::Read(ReadCmd::Draft {
             channel,
@@ -313,7 +316,8 @@ fn run() -> Result<()> {
         _ => {}
     }
 
-    let c = Client::resolve(cli.workspace.as_deref())?;
+    let mut c = Client::resolve(cli.workspace.as_deref())?;
+    c.json = cli.json;
 
     match cli.cmd {
         Cmd::Read(r) => match r {
@@ -383,6 +387,8 @@ struct Client {
     cookie: Option<String>,
     /// Cache key for this workspace: config name, or `env-<hash>` for SLACK_TOKEN.
     workspace: String,
+    /// Read commands print raw Slack records as NDJSON instead of text.
+    json: bool,
 }
 
 impl Client {
@@ -436,6 +442,7 @@ impl Client {
             token,
             cookie,
             workspace,
+            json: false,
         })
     }
 
@@ -486,7 +493,11 @@ impl Client {
                     .map(str::to_string)
                     .unwrap_or_else(|| format!("dm:{}", ch["user"].as_str().unwrap_or("?")));
                 if filter.map(|q| contains_ci(&name, q)).unwrap_or(true) {
-                    println!("{id}\t{name}");
+                    if self.json {
+                        emit_json(ch)?;
+                    } else {
+                        println!("{id}\t{name}");
+                    }
                     n += 1;
                 }
             }
@@ -495,7 +506,7 @@ impl Client {
                 break;
             }
         }
-        if n == 0 {
+        if n == 0 && !self.json {
             println!("no channels");
         }
         Ok(())
@@ -516,7 +527,11 @@ impl Client {
                     .map(|q| contains_ci(name, q) || contains_ci(real, q))
                     .unwrap_or(true)
                 {
-                    println!("{id}\t{name}\t{real}");
+                    if self.json {
+                        emit_json(u)?;
+                    } else {
+                        println!("{id}\t{name}\t{real}");
+                    }
                 }
             }
             cursor = next_cursor(&v);
@@ -536,15 +551,13 @@ impl Client {
             "conversations.history",
             &[("channel", &id), ("limit", &lim)],
         )?;
-        self.print_messages(&v);
-        Ok(())
+        self.print_messages(&v)
     }
 
     fn thread(&self, channel: &str, ts: &str) -> Result<()> {
         let id = self.resolve_channel(channel)?;
         let v = self.call("conversations.replies", &[("channel", &id), ("ts", ts)])?;
-        self.print_messages(&v);
-        Ok(())
+        self.print_messages(&v)
     }
 
     fn dm(&self, user: &str, limit: u32) -> Result<()> {
@@ -557,43 +570,22 @@ impl Client {
         self.read(&id, limit)
     }
 
-    fn print_messages(&self, v: &Value) {
+    fn print_messages(&self, v: &Value) -> Result<()> {
         let msgs = v["messages"].as_array().cloned().unwrap_or_default();
+        if self.json {
+            return emit_json_all(msgs.iter().rev());
+        }
         if msgs.is_empty() {
             println!("no messages");
-            return;
+            return Ok(());
         }
         // history returns newest-first; show oldest-first for readability.
         for m in msgs.iter().rev() {
             let ts = m["ts"].as_str().unwrap_or("");
             let user = m["user"].as_str().or(m["bot_id"].as_str()).unwrap_or("?");
-            let mut text = m["text"].as_str().unwrap_or("").replace('\n', " ");
-            let blocks = blocks_text(m);
-            if text.is_empty() {
-                text = blocks;
-            } else if !blocks.is_empty() && blocks != text {
-                text.push_str(&format!(" [blocks: {blocks}]"));
-            }
-            let mut tags = String::new();
-            if let Some(r) = m["reply_count"].as_i64() {
-                tags.push_str(&format!(" [thread:{r}]"));
-            }
-            let reacts = reactions_str(m);
-            if !reacts.is_empty() {
-                tags.push_str(&format!(" [{reacts}]"));
-            }
-            if m["files"].is_array() {
-                let nf = m["files"].as_array().map(|a| a.len()).unwrap_or(0);
-                tags.push_str(&format!(" [files:{nf}]"));
-            }
-            for a in m["attachments"].as_array().into_iter().flatten() {
-                let att = attachment_text(a);
-                if !att.is_empty() {
-                    tags.push_str(&format!(" [att: {att}]"));
-                }
-            }
-            println!("{ts}  {user}  {text}{tags}");
+            println!("{ts}  {user}  {}", message_text(m));
         }
+        Ok(())
     }
 
     /// `scli read search` — server-side full-text search via `search.messages`.
@@ -611,17 +603,21 @@ impl Client {
             .as_array()
             .cloned()
             .unwrap_or_default();
-        if matches.is_empty() {
-            println!("no matches");
-            return Ok(());
-        }
-        for m in &matches {
-            let chan_id = m["channel"]["id"].as_str().unwrap_or("");
-            let chan = m["channel"]["name"].as_str().unwrap_or("");
-            let ts = m["ts"].as_str().unwrap_or("");
-            let user = m["username"].as_str().or(m["user"].as_str()).unwrap_or("?");
-            let text = m["text"].as_str().unwrap_or("").replace('\n', " ");
-            println!("{chan_id}\t{chan}\t{ts}\t{user}\t{text}");
+        if self.json {
+            emit_json_all(matches.iter())?;
+        } else {
+            if matches.is_empty() {
+                println!("no matches");
+                return Ok(());
+            }
+            for m in &matches {
+                let chan_id = m["channel"]["id"].as_str().unwrap_or("");
+                let chan = m["channel"]["name"].as_str().unwrap_or("");
+                let ts = m["ts"].as_str().unwrap_or("");
+                let user = m["username"].as_str().or(m["user"].as_str()).unwrap_or("?");
+                let text = m["text"].as_str().unwrap_or("").replace('\n', " ");
+                println!("{chan_id}\t{chan}\t{ts}\t{user}\t{text}");
+            }
         }
         let total = v["messages"]["total"].as_i64().unwrap_or(0);
         if total > matches.len() as i64 {
@@ -649,14 +645,21 @@ impl Client {
             .ok_or_else(|| anyhow!("message not found"))?;
         let files = msg["files"].as_array().cloned().unwrap_or_default();
         let attachments = msg["attachments"].as_array().cloned().unwrap_or_default();
-        if files.is_empty() && attachments.is_empty() {
+        if self.json {
+            emit_json_all(attachments.iter().chain(files.iter()))?;
+            if download.is_none() {
+                return Ok(());
+            }
+        } else if files.is_empty() && attachments.is_empty() {
             println!("no files or attachments");
             return Ok(());
         }
         // Link/rich attachments (unfurls, bot/app cards): content lives in the
         // attachments array, not files. Downloading applies to uploaded files only.
-        for a in &attachments {
-            println!("attachment\t{}", attachment_text(a));
+        if !self.json {
+            for a in &attachments {
+                println!("attachment\t{}", attachment_text(a));
+            }
         }
         if let Some(dir) = &download {
             std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
@@ -668,6 +671,7 @@ impl Client {
                 .or(f["url_private"].as_str())
                 .unwrap_or("");
             match &download {
+                None if self.json => {}
                 None => println!("{name}\t{url}"),
                 Some(_) if url.is_empty() => println!("skipped {name}\t(no download url)"),
                 Some(dir) => {
@@ -888,7 +892,11 @@ impl Client {
         let mut n = 0;
         for c in &m.channels {
             if contains_ci(&c.name, query) {
-                println!("chan\t{}\t{}", c.id, c.name);
+                if self.json {
+                    emit_json(&serde_json::json!({"kind": "chan", "id": c.id, "name": c.name}))?;
+                } else {
+                    println!("chan\t{}\t{}", c.id, c.name);
+                }
                 n += 1;
             }
         }
@@ -897,11 +905,15 @@ impl Client {
                 || contains_ci(&u.real, query)
                 || contains_ci(&u.display, query)
             {
-                println!("user\t{}\t{}", u.id, u.name);
+                if self.json {
+                    emit_json(&serde_json::json!({"kind": "user", "id": u.id, "name": u.name}))?;
+                } else {
+                    println!("user\t{}\t{}", u.id, u.name);
+                }
                 n += 1;
             }
         }
-        if n == 0 {
+        if n == 0 && !self.json {
             println!("no match for '{query}'");
         }
         Ok(())
@@ -1105,11 +1117,52 @@ fn is_user_id(s: &str) -> bool {
     is_slack_id(s, &['U', 'W'])
 }
 
+fn emit_json(v: &Value) -> Result<()> {
+    println!("{}", serde_json::to_string(v)?);
+    Ok(())
+}
+
+fn emit_json_all<'a>(it: impl Iterator<Item = &'a Value>) -> Result<()> {
+    for v in it {
+        emit_json(v)?;
+    }
+    Ok(())
+}
+
 fn next_cursor(v: &Value) -> String {
     v["response_metadata"]["next_cursor"]
         .as_str()
         .unwrap_or("")
         .to_string()
+}
+
+/// One-line rendering of a message body: `text` (falling back to blocks, or
+/// appending them when they differ) plus thread/reaction/file/attachment tags.
+fn message_text(m: &Value) -> String {
+    let mut text = m["text"].as_str().unwrap_or("").replace('\n', " ");
+    let blocks = blocks_text(m);
+    if text.is_empty() {
+        text = blocks;
+    } else if !blocks.is_empty() && blocks != text {
+        text.push_str(&format!(" [blocks: {blocks}]"));
+    }
+    if let Some(r) = m["reply_count"].as_i64() {
+        text.push_str(&format!(" [thread:{r}]"));
+    }
+    let reacts = reactions_str(m);
+    if !reacts.is_empty() {
+        text.push_str(&format!(" [{reacts}]"));
+    }
+    if let Some(files) = m["files"].as_array() {
+        text.push_str(&format!(" [files:{}]", files.len()));
+    }
+    for a in m["attachments"].as_array().into_iter().flatten() {
+        let att = attachment_text(a);
+        if !att.is_empty() {
+            text.push_str(&format!(" [att: {att}]"));
+        }
+    }
+    text
 }
 
 fn reactions_str(m: &Value) -> String {
@@ -1316,16 +1369,21 @@ fn auth(name: &str, token: &str, cookie: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-fn workspaces() -> Result<()> {
+fn workspaces(json: bool) -> Result<()> {
     let cfg = load_config()?;
     let default = cfg["default"].as_str().unwrap_or("");
     match cfg["servers"].as_object() {
         Some(s) if !s.is_empty() => {
             for name in s.keys() {
-                let mark = if name == default { " (default)" } else { "" };
-                println!("{name}{mark}");
+                if json {
+                    emit_json(&serde_json::json!({"name": name, "default": name == default}))?;
+                } else {
+                    let mark = if name == default { " (default)" } else { "" };
+                    println!("{name}{mark}");
+                }
             }
         }
+        _ if json => {}
         _ => println!("no workspaces"),
     }
     Ok(())
@@ -1379,6 +1437,15 @@ fn parse_ver(s: &str) -> Option<(u64, u64, u64)> {
     let major = it.next()?.parse::<u64>().ok()?;
     let mut rest = it.map(|p| p.parse::<u64>().unwrap_or(0));
     Some((major, rest.next().unwrap_or(0), rest.next().unwrap_or(0)))
+}
+
+/// Lowercase checksum for `asset` from a `sha256sum`-style listing (two-space,
+/// single-space or `*binary` separators).
+fn find_sum(sums: &str, asset: &str) -> Option<String> {
+    sums.lines().find_map(|l| {
+        let (sum, file) = l.split_once("  ").or_else(|| l.split_once(' '))?;
+        (file.trim().trim_start_matches('*') == asset).then(|| sum.trim().to_lowercase())
+    })
 }
 
 /// Pick the release with the highest semver tag from a `/releases` listing,
@@ -1450,13 +1517,8 @@ fn self_update(check_only: bool) -> Result<()> {
     // Download the new binary and verify its checksum before touching anything.
     let bytes = download(&bin_url)?;
     let sums = String::from_utf8(download(&sums_url)?).context("SHA256SUMS not UTF-8")?;
-    let want_sum = sums
-        .lines()
-        .find_map(|l| {
-            let (sum, file) = l.split_once("  ").or_else(|| l.split_once(' '))?;
-            (file.trim() == want).then(|| sum.trim().to_lowercase())
-        })
-        .ok_or_else(|| anyhow!("no checksum for '{want}' in SHA256SUMS"))?;
+    let want_sum =
+        find_sum(&sums, &want).ok_or_else(|| anyhow!("no checksum for '{want}' in SHA256SUMS"))?;
     let got_sum = {
         use sha2::{Digest, Sha256};
         let mut h = Sha256::new();
@@ -1760,30 +1822,102 @@ mod tests {
         assert_eq!(blocks_text(&json!({"blocks": [{"type": "divider"}]})), "");
     }
 
-    fn select(m: &Value) -> String {
-        let mut text = m["text"].as_str().unwrap_or("").replace('\n', " ");
-        let blocks = blocks_text(m);
-        if text.is_empty() {
-            text = blocks;
-        } else if !blocks.is_empty() && blocks != text {
-            text.push_str(&format!(" [blocks: {blocks}]"));
-        }
-        text
-    }
-
     #[test]
-    fn text_falls_back_to_blocks_and_skips_duplicates() {
+    fn message_text_falls_back_to_blocks_and_skips_duplicates() {
         let section = json!([{"type": "section", "text": {"type": "mrkdwn", "text": "hello"}}]);
-        assert_eq!(select(&json!({"text": "", "blocks": section})), "hello");
         assert_eq!(
-            select(&json!({"text": "hello", "blocks": section})),
+            message_text(&json!({"text": "", "blocks": section})),
             "hello"
         );
         assert_eq!(
-            select(&json!({"text": "stub", "blocks": section})),
+            message_text(&json!({"text": "hello", "blocks": section})),
+            "hello"
+        );
+        assert_eq!(
+            message_text(&json!({"text": "stub", "blocks": section})),
             "stub [blocks: hello]"
         );
-        assert_eq!(select(&json!({"text": "plain"})), "plain");
+        assert_eq!(message_text(&json!({"text": "plain\nb"})), "plain b");
+    }
+
+    #[test]
+    fn message_text_appends_tags_in_order() {
+        let m = json!({
+            "text": "hi",
+            "reply_count": 3,
+            "reactions": [{"name": "eyes", "count": 2}, {"name": "+1"}],
+            "files": [{"id": "F1"}, {"id": "F2"}],
+            "attachments": [{"title": "T"}, {}]
+        });
+        assert_eq!(
+            message_text(&m),
+            "hi [thread:3] [eyes:2 +1:0] [files:2] [att: T]"
+        );
+        assert_eq!(message_text(&json!({})), "");
+    }
+
+    #[test]
+    fn reactions_and_cursor_helpers() {
+        assert_eq!(
+            reactions_str(&json!({"reactions": [{"name": "x", "count": 1}]})),
+            "x:1"
+        );
+        assert_eq!(reactions_str(&json!({})), "");
+        assert_eq!(
+            next_cursor(&json!({"response_metadata": {"next_cursor": "abc"}})),
+            "abc"
+        );
+        assert_eq!(next_cursor(&json!({})), "");
+    }
+
+    #[test]
+    fn contains_ci_and_short_hash() {
+        assert!(contains_ci("Hello World", "WORLD"));
+        assert!(contains_ci("abc", ""));
+        assert!(!contains_ci("abc", "d"));
+        assert_eq!(short_hash("abc"), "ba7816bf");
+        assert_eq!(short_hash("abc").len(), 8);
+        assert_ne!(short_hash("abc"), short_hash("abd"));
+    }
+
+    #[test]
+    fn find_sum_separators_and_case() {
+        let sums = "AABB  scli-linux-amd64\nccdd scli-linux-arm64\neeff *scli-darwin-arm64\n";
+        assert_eq!(find_sum(sums, "scli-linux-amd64").as_deref(), Some("aabb"));
+        assert_eq!(find_sum(sums, "scli-linux-arm64").as_deref(), Some("ccdd"));
+        assert_eq!(find_sum(sums, "scli-darwin-arm64").as_deref(), Some("eeff"));
+        assert_eq!(find_sum(sums, "scli-linux"), None);
+        assert_eq!(find_sum("", "scli-linux-amd64"), None);
+    }
+
+    #[test]
+    fn maps_json_round_trip() {
+        let m = Maps {
+            fetched: 42,
+            channels: vec![Chan {
+                id: "C01ABCDEF".into(),
+                name: "dev".into(),
+            }],
+            users: vec![Usr {
+                id: "U01ABCDEF".into(),
+                name: "alice".into(),
+                real: "Alice Smith".into(),
+                display: "Alice".into(),
+            }],
+        };
+        let back = Maps::from_json(&m.to_json());
+        assert_eq!(back.fetched, 42);
+        assert_eq!(back.channels.len(), 1);
+        assert_eq!(back.channels[0].id, "C01ABCDEF");
+        assert_eq!(back.channels[0].name, "dev");
+        assert_eq!(back.users.len(), 1);
+        assert_eq!(back.users[0].id, "U01ABCDEF");
+        assert_eq!(back.users[0].name, "alice");
+        assert_eq!(back.users[0].real, "Alice Smith");
+        assert_eq!(back.users[0].display, "Alice");
+        let empty = Maps::from_json(&json!({}));
+        assert_eq!(empty.fetched, 0);
+        assert!(empty.channels.is_empty() && empty.users.is_empty());
     }
 
     #[test]
@@ -2056,6 +2190,34 @@ mod tests {
             "public_channel,private_channel,mpim,im"
         );
         assert_eq!(SearchSort::Timestamp.as_str(), "timestamp");
+    }
+
+    #[test]
+    fn json_flag_is_global_and_defaults_off() {
+        let cli = Cli::try_parse_from(["scli", "read", "messages", "#g"]).unwrap();
+        assert!(!cli.json);
+        for args in [
+            vec!["scli", "--json", "read", "messages", "#g"],
+            vec!["scli", "read", "--json", "messages", "#g"],
+            vec!["scli", "read", "messages", "#g", "--json"],
+            vec!["scli", "read", "channels", "--type", "dm", "--json"],
+            vec!["scli", "read", "search", "q", "--json", "--sort", "score"],
+            vec!["scli", "read", "workspaces", "--json"],
+            vec!["scli", "--workspace", "w", "--json", "read", "ls", "x"],
+        ] {
+            let cli = Cli::try_parse_from(&args).unwrap_or_else(|e| panic!("{args:?}: {e}"));
+            assert!(cli.json, "{args:?}");
+        }
+    }
+
+    #[test]
+    fn emit_json_is_compact_single_line_per_record() {
+        let v = serde_json::json!({"ts": "1.2", "text": "a\nb", "nested": {"k": [1, 2]}});
+        let line = serde_json::to_string(&v).unwrap();
+        assert!(!line.contains('\n'));
+        assert_eq!(serde_json::from_str::<Value>(&line).unwrap(), v);
+        emit_json(&v).unwrap();
+        emit_json_all([v.clone(), v].iter()).unwrap();
     }
 
     #[test]
