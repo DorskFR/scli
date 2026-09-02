@@ -124,10 +124,21 @@ scli write send '#release' 'logs attached' -f build.log
 - **Attachments vs files**: Slack messages carry two distinct things — uploaded
   `files` and the `attachments` array (link unfurls, bot/app rich cards whose
   body lives in `title`/`title_link`/`text`/`fields`). `read messages`/`read
-  thread`/`read dm` tag messages with `[files:N]` and `[attachments:N]`; `scli
-  read files` lists both,
-  printing each link attachment as a compact `attachment\t…` line. `--download`
-  fetches uploaded files only.
+  thread`/`read dm` tag messages with `[files:N]` and render each attachment
+  inline as `[att: pretext | title<TAB>link | text | field: value]`; `scli read
+  files` lists both, printing each link attachment as a compact `attachment\t…`
+  line. `--download` fetches uploaded files only.
+- **Block Kit**: bot/app messages usually carry their content in `blocks`, with
+  an empty or stub `text`. `read messages`/`read thread`/`read dm` flatten
+  section/header/context/rich_text/image blocks to one line (parts joined with
+  ` | `, buttons collapsed to `[actions:N]`): when `text` is empty the block
+  text replaces it; when both are present and differ it is appended as
+  `[blocks: …]`. One physical line per message is always preserved, e.g.
+
+  ```
+  1700000000.000100  B0BOT  Deploy | *ok* | env: prod [att: Build #12\thttps://ci/12 | passed]
+  1700000000.000200  U0ALICE  see the thread [thread:3] [blocks: see the thread | :tada:]
+  ```
 - **Self-update**: `scli write update` replaces the running binary in place with the
   matching asset from the latest GitHub release (Linux amd64/arm64, macOS arm64),
   verifying its `SHA256SUMS` checksum first. `scli write update --check` only reports
