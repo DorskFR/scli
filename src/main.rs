@@ -7,7 +7,7 @@ use std::io::Read as _;
 use std::path::PathBuf;
 
 use anyhow::{anyhow, bail, Context, Result};
-use clap::{CommandFactory, Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
 use serde_json::Value;
 
@@ -50,9 +50,9 @@ enum Cmd {
 enum ReadCmd {
     /// List channels as `ID\tNAME` (public, private, DMs, group DMs).
     Channels {
-        /// public | private | dm | mpim | all
-        #[arg(long, default_value = "all")]
-        r#type: String,
+        /// Which conversation kinds to list.
+        #[arg(long, value_enum, default_value_t = ChannelType::All)]
+        r#type: ChannelType,
         /// Optional case-insensitive substring filter (client-side).
         filter: Option<String>,
     },
@@ -67,27 +67,40 @@ enum ReadCmd {
     /// Search cached channels AND users by case-insensitive substring.
     ///
     /// Prints `chan|user\tID\tNAME` — the quick way to find an id.
-    Ls { query: String },
+    Ls {
+        /// Case-insensitive substring matched against channel and user names.
+        query: String,
+    },
 
     /// Read recent messages in a channel.
     Messages {
         /// Channel ID (C…/G…/D…) or #name / @user.
         channel: String,
-        #[arg(short, long, default_value_t = 20)]
+        /// Max messages to fetch (Slack caps history at 1000).
+        #[arg(short, long, default_value_t = 20, value_parser = history_limit)]
         limit: u32,
     },
-    /// Read a thread's replies: scli read thread <channel> <ts>
-    Thread { channel: String, ts: String },
-    /// Read a DM with a user: scli read dm <@user|Uxxxx>
+    /// Read a thread's replies.
+    Thread {
+        /// Channel ID (C…/G…/D…) or #name / @user.
+        channel: String,
+        /// Thread parent message ts, e.g. 1700000000.000100.
+        ts: String,
+    },
+    /// Read a DM with a user.
     Dm {
+        /// User ID (U…/W…) or @name.
         user: String,
-        #[arg(short, long, default_value_t = 20)]
+        /// Max messages to fetch (Slack caps history at 1000).
+        #[arg(short, long, default_value_t = 20, value_parser = history_limit)]
         limit: u32,
     },
 
     /// List attachments on a message; optionally download them.
     Files {
+        /// Channel ID (C…/G…/D…) or #name / @user.
         channel: String,
+        /// Message ts, e.g. 1700000000.000100.
         ts: String,
         /// Download files into this directory instead of just listing.
         #[arg(long)]
@@ -101,19 +114,23 @@ enum ReadCmd {
     /// `in:#chan`, `from:@user`, `before:`/`after:`/`on:`, `has:link`, "exact phrase".
     /// Prints `CHANNEL_ID\tCHANNEL\tTS\tUSER\tTEXT` — a hit's ts feeds `read thread`.
     Search {
+        /// Slack search query, modifiers included.
         query: String,
+        /// Max hits to return (Slack caps a search page at 100).
         #[arg(short, long, default_value_t = 20)]
         limit: u32,
-        /// Result order: score | timestamp
-        #[arg(long, default_value = "score")]
-        sort: String,
+        /// Result order.
+        #[arg(long, value_enum, default_value_t = SearchSort::Score)]
+        sort: SearchSort,
     },
 
-    /// Compose a message locally without sending (prints the payload).
+    /// Compose a message payload locally without sending (prints JSON for inspection).
     Draft {
+        /// Channel ID (C…/G…/D…) or #name / @user.
         channel: String,
         /// Message text, or omit / "-" to read from stdin.
         text: Option<String>,
+        /// Reply in this thread (parent message ts).
         #[arg(long)]
         thread: Option<String>,
     },
@@ -124,9 +141,11 @@ enum ReadCmd {
 enum WriteCmd {
     /// Send a message; optionally in a thread and/or with file attachments.
     Send {
+        /// Channel ID (C…/G…/D…) or #name / @user.
         channel: String,
         /// Message text, or omit / "-" to read from stdin.
         text: Option<String>,
+        /// Reply in this thread (parent message ts).
         #[arg(long)]
         thread: Option<String>,
         /// Attach a file (repeatable).
@@ -134,9 +153,11 @@ enum WriteCmd {
         file: Vec<PathBuf>,
     },
 
-    /// Add a reaction: scli write react <channel> <ts> <emoji>
+    /// Add a reaction to a message.
     React {
+        /// Channel ID (C…/G…/D…) or #name / @user.
         channel: String,
+        /// Message ts, e.g. 1700000000.000100.
         ts: String,
         /// Emoji name without colons, e.g. thumbsup
         emoji: String,
@@ -146,19 +167,24 @@ enum WriteCmd {
     #[command(subcommand)]
     Remind(Remind),
 
-    /// Save a workspace to config: scli write auth <name> <token> [--cookie xoxd-…]
+    /// Save a workspace to config.
     ///
     /// Use a normal token (xoxp-/xoxb-), or a browser-session token (xoxc-…)
     /// together with --cookie <xoxd-…> copied from the Slack web client.
     Auth {
+        /// Workspace name to save under, e.g. myteam.
         name: String,
+        /// Slack token (xoxp-/xoxb-/xoxc-…).
         token: String,
         /// The `d` cookie (xoxd-…) required for an xoxc- session token.
         #[arg(long)]
         cookie: Option<String>,
     },
-    /// Set the default workspace: scli write default <name>
-    Default { name: String },
+    /// Set the default workspace.
+    Default {
+        /// Name of a workspace saved with `scli write auth`.
+        name: String,
+    },
 
     /// Force-refresh the local id<->name cache now.
     Sync,
@@ -175,12 +201,60 @@ enum WriteCmd {
 enum Remind {
     /// List your reminders.
     List,
-    /// Create a reminder: scli remind add "text" --at "in 30 minutes"
+    /// Create a reminder: scli write remind add "text" --at "in 30 minutes"
     Add {
+        /// Reminder text.
         text: String,
+        /// When, in Slack's natural language or a unix ts, e.g. 'in 30 minutes'.
         #[arg(long)]
         at: String,
     },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, ValueEnum)]
+enum ChannelType {
+    Public,
+    Private,
+    Dm,
+    Mpim,
+    All,
+}
+
+impl ChannelType {
+    fn api_types(self) -> &'static str {
+        match self {
+            Self::Public => "public_channel",
+            Self::Private => "private_channel",
+            Self::Dm => "im",
+            Self::Mpim => "mpim",
+            Self::All => "public_channel,private_channel,mpim,im",
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, ValueEnum)]
+enum SearchSort {
+    Score,
+    Timestamp,
+}
+
+impl SearchSort {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Score => "score",
+            Self::Timestamp => "timestamp",
+        }
+    }
+}
+
+const HISTORY_LIMIT_MAX: u32 = 1000;
+
+fn history_limit(s: &str) -> Result<u32, String> {
+    let n: u32 = s.parse().map_err(|e| format!("{e}"))?;
+    if n == 0 {
+        return Err("must be at least 1".into());
+    }
+    Ok(n.min(HISTORY_LIMIT_MAX))
 }
 
 fn main() {
@@ -243,7 +317,7 @@ fn run() -> Result<()> {
 
     match cli.cmd {
         Cmd::Read(r) => match r {
-            ReadCmd::Channels { r#type, filter } => c.channels(&r#type, filter.as_deref()),
+            ReadCmd::Channels { r#type, filter } => c.channels(r#type, filter.as_deref()),
             ReadCmd::Users { filter } => c.users(filter.as_deref()),
             ReadCmd::Messages { channel, limit } => c.read(&channel, limit),
             ReadCmd::Thread { channel, ts } => c.thread(&channel, &ts),
@@ -254,7 +328,7 @@ fn run() -> Result<()> {
                 download,
             } => c.files(&channel, &ts, download),
             ReadCmd::Ls { query } => c.ls(&query),
-            ReadCmd::Search { query, limit, sort } => c.search(&query, limit, &sort),
+            ReadCmd::Search { query, limit, sort } => c.search(&query, limit, sort),
             // offline reads already handled
             ReadCmd::Workspaces | ReadCmd::Draft { .. } => unreachable!(),
         },
@@ -332,7 +406,9 @@ impl Client {
                 Some(d) => d.to_string(),
                 None => match servers {
                     Some(s) if s.len() == 1 => s.keys().next().unwrap().clone(),
-                    _ => bail!("no workspace: set SLACK_TOKEN, or `scli auth <name> <token>`"),
+                    _ => {
+                        bail!("no workspace: set SLACK_TOKEN, or `scli write auth <name> <token>`")
+                    }
                 },
             },
         };
@@ -389,15 +465,8 @@ impl Client {
 
     // --- channels / users -------------------------------------------------
 
-    fn channels(&self, kind: &str, filter: Option<&str>) -> Result<()> {
-        let types = match kind {
-            "public" => "public_channel",
-            "private" => "private_channel",
-            "dm" => "im",
-            "mpim" => "mpim",
-            "all" => "public_channel,private_channel,mpim,im",
-            other => bail!("unknown type '{other}' (public|private|dm|mpim|all)"),
-        };
+    fn channels(&self, kind: ChannelType, filter: Option<&str>) -> Result<()> {
+        let types = kind.api_types();
         let mut cursor = String::new();
         let mut n = 0;
         loop {
@@ -529,10 +598,8 @@ impl Client {
 
     /// `scli read search` — server-side full-text search via `search.messages`.
     /// Tier-2 rate limit (~20 req/min): a 429 is surfaced, never retried here.
-    fn search(&self, query: &str, limit: u32, sort: &str) -> Result<()> {
-        if !matches!(sort, "score" | "timestamp") {
-            bail!("unknown sort '{sort}' (score|timestamp)");
-        }
+    fn search(&self, query: &str, limit: u32, sort: SearchSort) -> Result<()> {
+        let sort = sort.as_str();
         // search.messages caps count at 100 per page; one page keeps us frugal
         // with the Tier-2 budget, like `read messages` does with its one call.
         let count = limit.clamp(1, 100).to_string();
@@ -591,6 +658,9 @@ impl Client {
         for a in &attachments {
             println!("attachment\t{}", attachment_text(a));
         }
+        if let Some(dir) = &download {
+            std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+        }
         for f in &files {
             let name = f["name"].as_str().unwrap_or("file");
             let url = f["url_private_download"]
@@ -599,10 +669,10 @@ impl Client {
                 .unwrap_or("");
             match &download {
                 None => println!("{name}\t{url}"),
+                Some(_) if url.is_empty() => println!("skipped {name}\t(no download url)"),
                 Some(dir) => {
-                    std::fs::create_dir_all(dir).ok();
                     let bytes = self.get_bytes(url)?;
-                    let path = dir.join(name);
+                    let path = dir.join(safe_file_name(name, f["id"].as_str().unwrap_or("")));
                     std::fs::write(&path, bytes)
                         .with_context(|| format!("writing {}", path.display()))?;
                     println!("saved {}", path.display());
@@ -630,22 +700,19 @@ impl Client {
             let v = self.call("chat.postMessage", &params)?;
             println!("{}", v["ts"].as_str().unwrap_or("ok"));
         } else {
+            let mut ids = Vec::with_capacity(files.len());
             for f in files {
-                self.upload(&id, f, &text, thread.as_deref())?;
+                ids.push(self.upload_file(f)?);
             }
-            println!("ok");
+            let v = self.complete_upload(&id, &ids, &text, thread.as_deref())?;
+            println!("{}", shared_ts(&v).unwrap_or_else(|| ids.join(",")));
         }
         Ok(())
     }
 
-    /// Three-step external upload flow (files.upload is deprecated).
-    fn upload(
-        &self,
-        channel: &str,
-        path: &PathBuf,
-        comment: &str,
-        thread: Option<&str>,
-    ) -> Result<()> {
+    /// First two steps of the external upload flow (files.upload is deprecated):
+    /// reserve an upload URL, then POST the bytes. Returns the file id.
+    fn upload_file(&self, path: &PathBuf) -> Result<String> {
         let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
         let filename = path
             .file_name()
@@ -660,13 +727,26 @@ impl Client {
         let upload_url = v["upload_url"]
             .as_str()
             .ok_or_else(|| anyhow!("no upload_url returned"))?;
-        let file_id = v["file_id"].as_str().unwrap_or("").to_string();
+        let file_id = v["file_id"]
+            .as_str()
+            .ok_or_else(|| anyhow!("no file_id returned"))?
+            .to_string();
 
         ureq::post(upload_url)
             .send_bytes(&bytes)
             .with_context(|| "uploading file bytes")?;
+        Ok(file_id)
+    }
 
-        let files_json = serde_json::json!([{ "id": file_id }]).to_string();
+    /// Final step: attach every uploaded file to a single message.
+    fn complete_upload(
+        &self,
+        channel: &str,
+        ids: &[String],
+        comment: &str,
+        thread: Option<&str>,
+    ) -> Result<Value> {
+        let files_json = files_payload(ids).to_string();
         let mut params = vec![
             ("files", files_json.as_str()),
             ("channel_id", channel),
@@ -675,8 +755,7 @@ impl Client {
         if let Some(t) = thread {
             params.push(("thread_ts", t));
         }
-        self.call("files.completeUploadExternal", &params)?;
-        Ok(())
+        self.call("files.completeUploadExternal", &params)
     }
 
     fn react(&self, channel: &str, ts: &str, emoji: &str) -> Result<()> {
@@ -835,7 +914,10 @@ impl Client {
         if let Some(name) = s.strip_prefix('@') {
             let uid = self.resolve_user(name)?;
             let v = self.call("conversations.open", &[("users", &uid)])?;
-            return Ok(v["channel"]["id"].as_str().unwrap_or(s).to_string());
+            return v["channel"]["id"]
+                .as_str()
+                .map(str::to_string)
+                .ok_or_else(|| anyhow!("could not open DM with '{s}'"));
         }
         let name = s.strip_prefix('#').unwrap_or(s);
         if is_channel_id(name) {
@@ -843,8 +925,8 @@ impl Client {
         }
         // Cache-first: try fresh cache, and on a miss refetch once before failing.
         for force in [false, true] {
-            if let Some(c) = self.maps(force)?.channels.iter().find(|c| c.name == name) {
-                return Ok(c.id.clone());
+            if let Some(id) = self.maps(force)?.find_channel(name) {
+                return Ok(id);
             }
         }
         bail!("channel '{s}' not found")
@@ -852,17 +934,12 @@ impl Client {
 
     fn resolve_user(&self, s: &str) -> Result<String> {
         let name = s.strip_prefix('@').unwrap_or(s);
-        if name.starts_with('U') || name.starts_with('W') {
+        if is_user_id(name) {
             return Ok(name.to_string());
         }
         for force in [false, true] {
-            if let Some(u) = self
-                .maps(force)?
-                .users
-                .iter()
-                .find(|u| u.name == name || u.display == name)
-            {
-                return Ok(u.id.clone());
+            if let Some(id) = self.maps(force)?.find_user(name) {
+                return Ok(id);
             }
         }
         bail!("user '{s}' not found")
@@ -896,6 +973,29 @@ struct Maps {
 impl Maps {
     fn is_fresh(&self) -> bool {
         now_secs().saturating_sub(self.fetched) < CACHE_TTL_SECS
+    }
+
+    /// Case-insensitive name lookup, preferring an exact-case hit when several match.
+    fn find_channel(&self, name: &str) -> Option<String> {
+        pick(
+            self.channels
+                .iter()
+                .filter(|c| c.name.eq_ignore_ascii_case(name)),
+            |c| c.name == name,
+        )
+        .map(|c| c.id.clone())
+    }
+
+    fn find_user(&self, name: &str) -> Option<String> {
+        let ci = |u: &&Usr| {
+            u.name.eq_ignore_ascii_case(name)
+                || u.display.eq_ignore_ascii_case(name)
+                || u.real.eq_ignore_ascii_case(name)
+        };
+        pick(self.users.iter().filter(ci), |u| {
+            u.name == name || u.display == name || u.real == name
+        })
+        .map(|u| u.id.clone())
     }
 
     fn to_json(&self) -> Value {
@@ -981,9 +1081,28 @@ fn save_maps(workspace: &str, m: &Maps) -> Result<()> {
     Ok(())
 }
 
+fn pick<'a, T>(it: impl Iterator<Item = &'a T>, exact: impl Fn(&T) -> bool) -> Option<&'a T> {
+    let hits: Vec<&T> = it.collect();
+    hits.iter()
+        .copied()
+        .find(|x| exact(x))
+        .or_else(|| hits.first().copied())
+}
+
+/// Slack ids: one prefix letter followed by uppercase alphanumerics, 9+ chars total.
+fn is_slack_id(s: &str, prefixes: &[char]) -> bool {
+    let mut chars = s.chars();
+    s.len() >= 9
+        && chars.next().is_some_and(|c| prefixes.contains(&c))
+        && chars.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+}
+
 fn is_channel_id(s: &str) -> bool {
-    matches!(s.chars().next(), Some('C' | 'G' | 'D'))
-        && s.chars().all(|c| c.is_ascii_alphanumeric())
+    is_slack_id(s, &['C', 'G', 'D'])
+}
+
+fn is_user_id(s: &str) -> bool {
+    is_slack_id(s, &['U', 'W'])
 }
 
 fn next_cursor(v: &Value) -> String {
@@ -1229,7 +1348,7 @@ fn set_default(name: &str) -> Result<()> {
 // `SHA256SUMS` file (see .github/workflows/release.yml).
 // ---------------------------------------------------------------------------
 
-const LATEST_API: &str = "https://api.github.com/repos/dorskFR/scli/releases/latest";
+const RELEASES_API: &str = "https://api.github.com/repos/dorskFR/scli/releases?per_page=20";
 const UA: &str = concat!("scli/", env!("CARGO_PKG_VERSION"));
 
 /// The release-asset name for the host platform, e.g. `scli-linux-amd64`.
@@ -1251,35 +1370,48 @@ fn asset_name() -> Result<String> {
     Ok(format!("scli-{os}-{arch}"))
 }
 
-/// Parse a `vX.Y.Z` (or `X.Y.Z`) tag into a comparable tuple. Missing/extra parts
-/// are tolerated (defaulting to 0 / ignored).
-fn parse_ver(s: &str) -> (u64, u64, u64) {
+/// Parse a `vX.Y.Z` (or `X.Y.Z`) tag into a comparable tuple; `None` for tags
+/// that don't start with a numeric major (e.g. the rolling `latest`). Missing
+/// minor/patch default to 0; pre-release/build suffixes are ignored.
+fn parse_ver(s: &str) -> Option<(u64, u64, u64)> {
     let s = s.trim().trim_start_matches('v');
-    let mut it = s
-        .split(['.', '-', '+'])
-        .map(|p| p.parse::<u64>().unwrap_or(0));
-    (
-        it.next().unwrap_or(0),
-        it.next().unwrap_or(0),
-        it.next().unwrap_or(0),
-    )
+    let mut it = s.split(['.', '-', '+']);
+    let major = it.next()?.parse::<u64>().ok()?;
+    let mut rest = it.map(|p| p.parse::<u64>().unwrap_or(0));
+    Some((major, rest.next().unwrap_or(0), rest.next().unwrap_or(0)))
 }
 
-/// Fetch the latest release JSON from GitHub (short timeout, sends a User-Agent).
+/// Pick the release with the highest semver tag from a `/releases` listing,
+/// skipping non-semver tags such as the rolling `latest`.
+fn newest_semver_release(releases: &Value) -> Option<&Value> {
+    releases
+        .as_array()?
+        .iter()
+        .filter_map(|r| parse_ver(r["tag_name"].as_str()?).map(|v| (v, r)))
+        .max_by_key(|(v, _)| *v)
+        .map(|(_, r)| r)
+}
+
+/// Fetch the newest semver release JSON from GitHub (short timeout, sends a
+/// User-Agent). `/releases/latest` is unusable: the rolling `latest` release
+/// shadows it.
 fn fetch_latest() -> Result<Value> {
-    let resp = ureq::get(LATEST_API)
+    let resp = ureq::get(RELEASES_API)
         .set("User-Agent", UA)
         .set("Accept", "application/vnd.github+json")
         .timeout(std::time::Duration::from_secs(10))
         .call();
-    match resp {
-        Ok(r) => r.into_json().context("parsing release JSON"),
+    let releases: Value = match resp {
+        Ok(r) => r.into_json().context("parsing releases JSON")?,
         Err(ureq::Error::Status(code, r)) => {
             let txt = r.into_string().unwrap_or_default();
             bail!("GitHub API HTTP {code}: {txt}")
         }
-        Err(e) => Err(e).context("querying GitHub releases"),
-    }
+        Err(e) => return Err(e).context("querying GitHub releases"),
+    };
+    newest_semver_release(&releases)
+        .cloned()
+        .ok_or_else(|| anyhow!("no semver release found"))
 }
 
 fn self_update(check_only: bool) -> Result<()> {
@@ -1443,10 +1575,143 @@ fn update_cache_path() -> Result<PathBuf> {
     Ok(config_path()?.parent().unwrap().join("update-check.json"))
 }
 
+fn files_payload(ids: &[String]) -> Value {
+    Value::Array(
+        ids.iter()
+            .map(|id| serde_json::json!({ "id": id }))
+            .collect(),
+    )
+}
+
+/// Message ts of a completeUploadExternal response, taken from the first share
+/// of the first file (Slack posts one message for the whole batch).
+fn shared_ts(v: &Value) -> Option<String> {
+    let shares = &v["files"].as_array()?.first()?["shares"];
+    ["public", "private"]
+        .iter()
+        .filter_map(|k| shares[k].as_object())
+        .flat_map(|chans| chans.values())
+        .filter_map(|posts| posts.as_array())
+        .flat_map(|posts| posts.iter())
+        .find_map(|p| p["ts"].as_str().map(str::to_string))
+}
+
+/// Basename of a Slack-supplied filename, so a payload cannot escape the
+/// download dir; falls back to the file id, then "file".
+fn safe_file_name(name: &str, id: &str) -> String {
+    let base = name.rsplit(['/', '\\']).next().unwrap_or("").trim();
+    if base.is_empty() || base == "." || base == ".." {
+        return if id.is_empty() {
+            "file".into()
+        } else {
+            id.into()
+        };
+    }
+    base.to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn slack_id_predicates() {
+        for id in ["U0123ABCD", "W0123ABCD", "U01234567890"] {
+            assert!(is_user_id(id), "{id}");
+            assert!(!is_channel_id(id), "{id}");
+        }
+        for id in ["C01ABCDEF", "G01ABCDEF", "D01ABCDEF"] {
+            assert!(is_channel_id(id), "{id}");
+            assert!(!is_user_id(id), "{id}");
+        }
+        for s in [
+            "Wendy",
+            "Ulrich",
+            "Will",
+            "U0123abcd",
+            "U0123ABC",
+            "",
+            "U",
+            "Umbrella-01",
+        ] {
+            assert!(!is_user_id(s), "{s}");
+        }
+        for s in [
+            "Dev",
+            "General",
+            "C01abcdef",
+            "C01ABCDE",
+            "c01ABCDEF",
+            "Design_team",
+        ] {
+            assert!(!is_channel_id(s), "{s}");
+        }
+    }
+
+    #[test]
+    fn name_matching_is_case_insensitive_and_prefers_exact_case() {
+        let u = |id: &str, name: &str, real: &str, display: &str| Usr {
+            id: id.into(),
+            name: name.into(),
+            real: real.into(),
+            display: display.into(),
+        };
+        let m = Maps {
+            fetched: 0,
+            channels: vec![
+                Chan {
+                    id: "C01ABCDEF".into(),
+                    name: "Dev".into(),
+                },
+                Chan {
+                    id: "C02ABCDEF".into(),
+                    name: "dev".into(),
+                },
+            ],
+            users: vec![
+                u("U01ABCDEF", "alice", "Alice Smith", "Alice"),
+                u("U02ABCDEF", "wendy", "Wendy Wu", ""),
+            ],
+        };
+        assert_eq!(m.find_channel("dev").as_deref(), Some("C02ABCDEF"));
+        assert_eq!(m.find_channel("Dev").as_deref(), Some("C01ABCDEF"));
+        assert_eq!(m.find_channel("DEV").as_deref(), Some("C01ABCDEF"));
+        assert_eq!(m.find_channel("general"), None);
+        assert_eq!(m.find_user("Alice").as_deref(), Some("U01ABCDEF"));
+        assert_eq!(m.find_user("ALICE").as_deref(), Some("U01ABCDEF"));
+        assert_eq!(m.find_user("alice smith").as_deref(), Some("U01ABCDEF"));
+        assert_eq!(m.find_user("Wendy").as_deref(), Some("U02ABCDEF"));
+        assert_eq!(m.find_user("bob"), None);
+    }
+
+    #[test]
+    fn parse_ver_semver_and_rejects_rolling_tag() {
+        assert_eq!(parse_ver("v0.6.0"), Some((0, 6, 0)));
+        assert_eq!(parse_ver("1.2.3"), Some((1, 2, 3)));
+        assert_eq!(parse_ver(" v2 "), Some((2, 0, 0)));
+        assert_eq!(parse_ver("v1.2.3-rc1+build"), Some((1, 2, 3)));
+        assert_eq!(parse_ver("latest"), None);
+        assert_eq!(parse_ver(""), None);
+        assert!(parse_ver("v0.10.0") > parse_ver("v0.9.9"));
+    }
+
+    #[test]
+    fn newest_semver_release_skips_rolling_latest() {
+        let releases = json!([
+            {"tag_name": "latest", "assets": []},
+            {"tag_name": "v0.13.0"},
+            {"tag_name": "v0.14.0", "assets": [{"name": "SHA256SUMS"}]},
+            {"tag_name": "v0.9.0"},
+            {"no_tag": true},
+        ]);
+        let picked = newest_semver_release(&releases).unwrap();
+        assert_eq!(picked["tag_name"], "v0.14.0");
+        assert_eq!(picked["assets"][0]["name"], "SHA256SUMS");
+        assert!(newest_semver_release(&json!([{"tag_name": "latest"}])).is_none());
+        assert!(newest_semver_release(&json!([])).is_none());
+        assert!(newest_semver_release(&Value::Null).is_none());
+    }
 
     #[test]
     fn blocks_rich_text_user_link_emoji() {
@@ -1539,5 +1804,273 @@ mod tests {
             "https://u"
         );
         assert_eq!(attachment_text(&json!({})), "");
+    }
+
+    #[test]
+    fn files_payload_one_entry_per_id() {
+        let ids = vec!["F1".to_string(), "F2".to_string()];
+        assert_eq!(files_payload(&ids), json!([{ "id": "F1" }, { "id": "F2" }]));
+        assert_eq!(files_payload(&[]), json!([]));
+    }
+
+    #[test]
+    fn shared_ts_reads_public_or_private_share() {
+        let pub_ = json!({ "files": [{ "shares": { "public": { "C1": [{ "ts": "1.1" }] } } }] });
+        assert_eq!(shared_ts(&pub_).as_deref(), Some("1.1"));
+        let priv_ = json!({ "files": [{ "shares": { "private": { "D1": [{ "ts": "2.2" }] } } }] });
+        assert_eq!(shared_ts(&priv_).as_deref(), Some("2.2"));
+        assert_eq!(shared_ts(&json!({ "files": [{ "id": "F1" }] })), None);
+        assert_eq!(shared_ts(&json!({ "ok": true })), None);
+    }
+
+    #[test]
+    fn safe_file_name_strips_paths_and_falls_back() {
+        assert_eq!(safe_file_name("report.pdf", "F1"), "report.pdf");
+        assert_eq!(safe_file_name("../../etc/passwd", "F1"), "passwd");
+        assert_eq!(safe_file_name("a\\b\\c.txt", "F1"), "c.txt");
+        assert_eq!(safe_file_name("..", "F1"), "F1");
+        assert_eq!(safe_file_name("/", "F1"), "F1");
+        assert_eq!(safe_file_name("", ""), "file");
+        assert_eq!(safe_file_name("  ", "F9"), "F9");
+    }
+
+    fn subcommand_paths(cmd: &clap::Command, prefix: &[String], out: &mut Vec<Vec<String>>) {
+        for sub in cmd.get_subcommands() {
+            let mut path = prefix.to_vec();
+            path.push(sub.get_name().to_string());
+            out.push(path.clone());
+            subcommand_paths(sub, &path, out);
+        }
+    }
+
+    fn help_strings(cmd: &clap::Command, out: &mut Vec<String>) {
+        for s in [
+            cmd.get_about(),
+            cmd.get_long_about(),
+            cmd.get_before_help(),
+            cmd.get_after_help(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            out.push(s.to_string());
+        }
+        for arg in cmd.get_arguments() {
+            for s in [arg.get_help(), arg.get_long_help()].into_iter().flatten() {
+                out.push(s.to_string());
+            }
+        }
+        for sub in cmd.get_subcommands() {
+            help_strings(sub, out);
+        }
+    }
+
+    fn is_command_word(tok: &str) -> bool {
+        !tok.is_empty() && tok.chars().all(|c| c.is_ascii_lowercase() || c == '-')
+    }
+
+    fn stale_scli_references(text: &str, paths: &[Vec<String>]) -> Vec<String> {
+        let mut stale = Vec::new();
+        for (idx, _) in text.match_indices("scli ") {
+            let before = &text[..idx];
+            if before
+                .chars()
+                .last()
+                .is_some_and(|c| c.is_alphanumeric() || c == '/' || c == '-')
+            {
+                continue;
+            }
+            let strict = matches!(before.trim_end_matches(' ').chars().last(), Some('`' | ':'));
+            let rest = &text[idx + 5..];
+            let mut tokens: Vec<&str> = Vec::new();
+            let mut skip_value = false;
+            for seg in rest.split(' ') {
+                if skip_value {
+                    skip_value = false;
+                    continue;
+                }
+                if seg.starts_with("--") {
+                    skip_value = !seg.contains('=');
+                    continue;
+                }
+                let word = seg.trim_end_matches(|c: char| !c.is_ascii_lowercase() && c != '-');
+                if !is_command_word(word) {
+                    break;
+                }
+                tokens.push(word);
+                if word.len() != seg.len() {
+                    break;
+                }
+            }
+            let is_top_level = tokens
+                .first()
+                .is_some_and(|t| paths.iter().any(|p| p.len() == 1 && p[0] == *t));
+            if !strict && !is_top_level {
+                continue;
+            }
+            let mut walked: Vec<String> = Vec::new();
+            for tok in tokens {
+                let candidate: Vec<String> = walked
+                    .iter()
+                    .cloned()
+                    .chain(std::iter::once(tok.to_string()))
+                    .collect();
+                if paths.contains(&candidate) {
+                    walked = candidate;
+                } else if walked.is_empty()
+                    || paths
+                        .iter()
+                        .any(|p| p.starts_with(&walked) && p.len() > walked.len())
+                {
+                    stale.push(format!(
+                        "scli {}",
+                        rest.split(['\n', '"', '`']).next().unwrap_or("").trim()
+                    ));
+                    break;
+                } else {
+                    break;
+                }
+            }
+        }
+        stale
+    }
+
+    #[test]
+    fn stale_reference_detector_flags_only_bad_paths() {
+        let paths = vec![
+            vec!["read".to_string()],
+            vec!["read".to_string(), "thread".to_string()],
+            vec!["write".to_string()],
+            vec!["write".to_string(), "send".to_string()],
+        ];
+        let ok = [
+            "use `scli read thread <c> <ts>`",
+            "scli never sleeps or retries",
+            "ghcr.io/dorskfr/scli channels",
+            "scli --workspace w read thread",
+            "\"scli is up to date\"",
+        ];
+        for text in ok {
+            assert!(stale_scli_references(text, &paths).is_empty(), "{text}");
+        }
+        let bad = [
+            (format!("pipe it into `{} send`", "scli"), "send"),
+            (format!("post: {} write post x", "scli"), "write post x"),
+            (format!("{} write post", "scli"), "write post"),
+        ];
+        for (text, want) in bad {
+            assert_eq!(
+                stale_scli_references(&text, &paths),
+                vec![format!("scli {want}")],
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn scli_command_references_resolve_to_real_subcommands() {
+        let cmd = Cli::command();
+        let mut paths = Vec::new();
+        subcommand_paths(&cmd, &[], &mut paths);
+        assert!(paths.iter().any(|p| p == &["read", "thread"]));
+        assert!(paths.iter().any(|p| p == &["write", "remind", "add"]));
+
+        let mut texts = Vec::new();
+        help_strings(&cmd, &mut texts);
+        texts.push(include_str!("main.rs").to_string());
+        texts.push(include_str!("../README.md").to_string());
+
+        let stale: Vec<String> = texts
+            .iter()
+            .flat_map(|t| stale_scli_references(t, &paths))
+            .collect();
+        assert!(stale.is_empty(), "stale command references: {stale:?}");
+    }
+
+    fn undocumented_args(cmd: &clap::Command, prefix: &str, out: &mut Vec<String>) {
+        for arg in cmd.get_arguments() {
+            if matches!(arg.get_id().as_str(), "help" | "version") {
+                continue;
+            }
+            let documented = arg
+                .get_help()
+                .or(arg.get_long_help())
+                .is_some_and(|h| !h.to_string().trim().is_empty());
+            if !documented {
+                out.push(format!("{prefix} <{}>", arg.get_id()));
+            }
+        }
+        for sub in cmd.get_subcommands() {
+            let documented = sub
+                .get_about()
+                .or(sub.get_long_about())
+                .is_some_and(|h| !h.to_string().trim().is_empty());
+            if !documented {
+                out.push(format!("{prefix} {}", sub.get_name()));
+            }
+            undocumented_args(sub, &format!("{prefix} {}", sub.get_name()), out);
+        }
+    }
+
+    #[test]
+    fn every_arg_and_subcommand_has_help() {
+        let mut missing = Vec::new();
+        undocumented_args(&Cli::command(), "scli", &mut missing);
+        assert!(missing.is_empty(), "undocumented: {missing:?}");
+    }
+
+    #[test]
+    fn value_enums_keep_legacy_string_values() {
+        let cli = Cli::try_parse_from(["scli", "read", "channels", "--type", "dm"]).unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Cmd::Read(ReadCmd::Channels {
+                r#type: ChannelType::Dm,
+                ..
+            })
+        ));
+        for t in ["public", "private", "dm", "mpim", "all"] {
+            Cli::try_parse_from(["scli", "read", "channels", "--type", t]).unwrap();
+        }
+        for s in ["score", "timestamp"] {
+            Cli::try_parse_from(["scli", "read", "search", "q", "--sort", s]).unwrap();
+        }
+        let err = Cli::try_parse_from([
+            "scli",
+            "--workspace",
+            "nope",
+            "read",
+            "channels",
+            "--type",
+            "foo",
+        ])
+        .map(|_| ())
+        .unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::InvalidValue);
+        let err = Cli::try_parse_from(["scli", "read", "search", "q", "--sort", "Score"])
+            .map(|_| ())
+            .unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::InvalidValue);
+        assert_eq!(
+            ChannelType::All.api_types(),
+            "public_channel,private_channel,mpim,im"
+        );
+        assert_eq!(SearchSort::Timestamp.as_str(), "timestamp");
+    }
+
+    #[test]
+    fn history_limit_is_clamped_to_slack_max() {
+        assert_eq!(history_limit("20"), Ok(20));
+        assert_eq!(history_limit("1000"), Ok(1000));
+        assert_eq!(history_limit("5000"), Ok(1000));
+        assert!(history_limit("0").is_err());
+        assert!(history_limit("x").is_err());
+        let cli = Cli::try_parse_from(["scli", "read", "messages", "#g", "-l", "9999"]).unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Cmd::Read(ReadCmd::Messages { limit: 1000, .. })
+        ));
+        let cli = Cli::try_parse_from(["scli", "read", "dm", "@a", "-l", "50"]).unwrap();
+        assert!(matches!(cli.cmd, Cmd::Read(ReadCmd::Dm { limit: 50, .. })));
     }
 }

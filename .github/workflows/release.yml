@@ -71,6 +71,7 @@ jobs:
         with:
           tag_name: ${{ env.TAG }}
           generate_release_notes: true
+          make_latest: "true"
           files: |
             dist/scli-*
             dist/SHA256SUMS
@@ -86,6 +87,7 @@ jobs:
           gh release create latest \
             --repo "$GITHUB_REPOSITORY" \
             --target "$GITHUB_SHA" \
+            --latest=false \
             --title "latest (${TAG})" \
             --notes "Rolling pointer to the most recent release (${TAG})." \
             dist/scli-* dist/SHA256SUMS

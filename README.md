@@ -15,16 +15,20 @@ chmod +x scli && sudo mv scli /usr/local/bin/
 cargo install --git https://github.com/dorskFR/scli
 
 # or as a container
-docker run --rm -e SLACK_TOKEN ghcr.io/dorskfr/scli channels
+docker run --rm -e SLACK_TOKEN ghcr.io/dorskfr/scli read channels
 ```
 
 ## Setup
 
 `scli` needs a Slack **user token** (`xoxp-…`) from a Slack app with the scopes
-you intend to use (`channels:read`, `channels:history`, `users:read`,
-`chat:write`, `reactions:read`, `reactions:write`, `files:read`, `files:write`,
-`search:read` for `read search`, and `reminders:read`/`reminders:write` if you
-use reminders).
+you intend to use: `channels:read`/`channels:history` (public channels),
+`groups:read`/`groups:history` (private channels), `im:read`/`im:history`/`im:write`
+(DMs; `read dm` opens the conversation), `mpim:read`/`mpim:history` (group DMs),
+`users:read`, `chat:write`, `reactions:read`/`reactions:write`,
+`files:read`/`files:write`, `search:read` for `read search`, and
+`reminders:read`/`reminders:write` if you use reminders. Without the `groups:*`,
+`im:*` or `mpim:*` scopes, `read channels --type private|dm|mpim` (and the
+default `all`) fail with `missing_scope`.
 
 ```sh
 export SLACK_TOKEN=xoxp-...
@@ -115,8 +119,11 @@ scli write send '#release' 'logs attached' -f build.log
   is rate-limited (Tier 2, ~20 req/min); scli never sleeps or retries — on 429 it
   exits non-zero with `rate limited — retry after Ns` so a calling agent knows to
   wait.
-- **Drafts** aren't a public Slack API — `scli draft` composes a payload locally;
-  pipe it into `scli send` to actually post.
+- **Drafts** aren't a public Slack API — `scli read draft` only composes the
+  `chat.postMessage` payload locally and prints it as JSON for inspection; it
+  never sends. To post, call `scli write send` with the same arguments (`send`
+  reads stdin as message *text*, so piping the draft JSON into it would post the
+  JSON literally).
 - **Reminders** (`reminders.add`/`reminders.list`) were deprecated by Slack in
   2023 and may stop working without notice; `scli` warns on use.
 - File uploads use the current `files.getUploadURLExternal` +
