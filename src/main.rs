@@ -498,7 +498,13 @@ impl Client {
         for m in msgs.iter().rev() {
             let ts = m["ts"].as_str().unwrap_or("");
             let user = m["user"].as_str().or(m["bot_id"].as_str()).unwrap_or("?");
-            let text = m["text"].as_str().unwrap_or("").replace('\n', " ");
+            let mut text = m["text"].as_str().unwrap_or("").replace('\n', " ");
+            let blocks = blocks_text(m);
+            if text.is_empty() {
+                text = blocks;
+            } else if !blocks.is_empty() && blocks != text {
+                text.push_str(&format!(" [blocks: {blocks}]"));
+            }
             let mut tags = String::new();
             if let Some(r) = m["reply_count"].as_i64() {
                 tags.push_str(&format!(" [thread:{r}]"));
@@ -511,12 +517,11 @@ impl Client {
                 let nf = m["files"].as_array().map(|a| a.len()).unwrap_or(0);
                 tags.push_str(&format!(" [files:{nf}]"));
             }
-            if let Some(na) = m["attachments"]
-                .as_array()
-                .map(|a| a.len())
-                .filter(|n| *n > 0)
-            {
-                tags.push_str(&format!(" [attachments:{na}]"));
+            for a in m["attachments"].as_array().into_iter().flatten() {
+                let att = attachment_text(a);
+                if !att.is_empty() {
+                    tags.push_str(&format!(" [att: {att}]"));
+                }
             }
             println!("{ts}  {user}  {text}{tags}");
         }
@@ -582,32 +587,9 @@ impl Client {
             return Ok(());
         }
         // Link/rich attachments (unfurls, bot/app cards): content lives in the
-        // attachments array, not files. Print it in compact, grep-friendly form.
-        // Downloading applies to uploaded files only; attachments are always shown.
+        // attachments array, not files. Downloading applies to uploaded files only.
         for a in &attachments {
-            let title = a["title"].as_str().unwrap_or("");
-            let link = a["title_link"]
-                .as_str()
-                .or(a["from_url"].as_str())
-                .unwrap_or("");
-            let pretext = a["pretext"].as_str().unwrap_or("").replace('\n', " ");
-            let text = a["text"].as_str().unwrap_or("").replace('\n', " ");
-            let mut parts: Vec<String> = Vec::new();
-            if !pretext.is_empty() {
-                parts.push(pretext);
-            }
-            if !title.is_empty() || !link.is_empty() {
-                parts.push(format!("{title}\t{link}").trim().to_string());
-            }
-            if !text.is_empty() {
-                parts.push(text);
-            }
-            for f in a["fields"].as_array().into_iter().flatten() {
-                let t = f["title"].as_str().unwrap_or("");
-                let val = f["value"].as_str().unwrap_or("").replace('\n', " ");
-                parts.push(format!("{t}: {val}").trim().to_string());
-            }
-            println!("attachment\t{}", parts.join(" | "));
+            println!("attachment\t{}", attachment_text(a));
         }
         for f in &files {
             let name = f["name"].as_str().unwrap_or("file");
@@ -1029,6 +1011,107 @@ fn reactions_str(m: &Value) -> String {
         .unwrap_or_default()
 }
 
+/// Compact one-line rendering of a link/rich attachment:
+/// pretext | title<TAB>link | text | field: value ...
+fn attachment_text(a: &Value) -> String {
+    let title = a["title"].as_str().unwrap_or("");
+    let link = a["title_link"]
+        .as_str()
+        .or(a["from_url"].as_str())
+        .unwrap_or("");
+    let pretext = a["pretext"].as_str().unwrap_or("").replace('\n', " ");
+    let text = a["text"].as_str().unwrap_or("").replace('\n', " ");
+    let mut parts: Vec<String> = Vec::new();
+    if !pretext.is_empty() {
+        parts.push(pretext);
+    }
+    if !title.is_empty() || !link.is_empty() {
+        parts.push(format!("{title}\t{link}").trim().to_string());
+    }
+    if !text.is_empty() {
+        parts.push(text);
+    }
+    for f in a["fields"].as_array().into_iter().flatten() {
+        let t = f["title"].as_str().unwrap_or("");
+        let val = f["value"].as_str().unwrap_or("").replace('\n', " ");
+        parts.push(format!("{t}: {val}").trim().to_string());
+    }
+    parts.join(" | ")
+}
+
+/// Flatten Block Kit `blocks` to one line; parts joined with " | ".
+/// Interactive blocks are skipped (`actions` becomes `[actions:N]`).
+fn blocks_text(m: &Value) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let mut push = |s: String| {
+        let s = s.replace('\n', " ").trim().to_string();
+        if !s.is_empty() {
+            parts.push(s);
+        }
+    };
+    for b in m["blocks"].as_array().into_iter().flatten() {
+        match b["type"].as_str().unwrap_or("") {
+            "section" => {
+                push(b["text"]["text"].as_str().unwrap_or("").to_string());
+                for f in b["fields"].as_array().into_iter().flatten() {
+                    push(f["text"].as_str().unwrap_or("").to_string());
+                }
+            }
+            "header" => push(b["text"]["text"].as_str().unwrap_or("").to_string()),
+            "context" => {
+                for e in b["elements"].as_array().into_iter().flatten() {
+                    let s = if e["type"].as_str() == Some("image") {
+                        e["alt_text"].as_str()
+                    } else {
+                        e["text"].as_str()
+                    };
+                    push(s.unwrap_or("").to_string());
+                }
+            }
+            "rich_text" => {
+                let mut out = String::new();
+                rich_text_walk(&b["elements"], &mut out);
+                push(out);
+            }
+            "image" => push(
+                b["alt_text"]
+                    .as_str()
+                    .or(b["title"]["text"].as_str())
+                    .unwrap_or("")
+                    .to_string(),
+            ),
+            "actions" => {
+                let n = b["elements"].as_array().map(|a| a.len()).unwrap_or(0);
+                push(format!("[actions:{n}]"));
+            }
+            _ => {}
+        }
+    }
+    parts.join(" | ")
+}
+
+fn rich_text_walk(elements: &Value, out: &mut String) {
+    for e in elements.as_array().into_iter().flatten() {
+        match e["type"].as_str().unwrap_or("") {
+            "text" => out.push_str(e["text"].as_str().unwrap_or("")),
+            "link" => out.push_str(e["text"].as_str().or(e["url"].as_str()).unwrap_or("")),
+            "user" => out.push_str(&format!("<@{}>", e["user_id"].as_str().unwrap_or(""))),
+            "channel" => out.push_str(&format!("<#{}>", e["channel_id"].as_str().unwrap_or(""))),
+            "emoji" => out.push_str(&format!(":{}:", e["name"].as_str().unwrap_or(""))),
+            "rich_text_section"
+            | "rich_text_list"
+            | "rich_text_quote"
+            | "rich_text_preformatted" => {
+                if !out.is_empty() && !out.ends_with(' ') {
+                    out.push(' ');
+                }
+                rich_text_walk(&e["elements"], out);
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Parse a Slack Web API response: enforce `ok: true`.
 fn read(resp: Result<ureq::Response, ureq::Error>, method: &str) -> Result<Value> {
     let body = match resp {
@@ -1358,4 +1441,103 @@ fn update_notice() {
 
 fn update_cache_path() -> Result<PathBuf> {
     Ok(config_path()?.parent().unwrap().join("update-check.json"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn blocks_rich_text_user_link_emoji() {
+        let m = json!({"blocks": [{"type": "rich_text", "elements": [
+            {"type": "rich_text_section", "elements": [
+                {"type": "text", "text": "hi "},
+                {"type": "user", "user_id": "U1"},
+                {"type": "text", "text": " see "},
+                {"type": "link", "url": "https://x.y"},
+                {"type": "text", "text": " "},
+                {"type": "emoji", "name": "tada"},
+                {"type": "channel", "channel_id": "C9"}
+            ]},
+            {"type": "rich_text_list", "elements": [
+                {"type": "rich_text_section", "elements": [{"type": "text", "text": "a\nb"}]}
+            ]}
+        ]}]});
+        assert_eq!(blocks_text(&m), "hi <@U1> see https://x.y :tada:<#C9> a b");
+    }
+
+    #[test]
+    fn blocks_section_header_context_image_skip() {
+        let m = json!({"blocks": [
+            {"type": "header", "text": {"type": "plain_text", "text": "Deploy"}},
+            {"type": "section", "text": {"type": "mrkdwn", "text": "*ok*\nline2"},
+             "fields": [{"type": "mrkdwn", "text": "env: prod"}, {"type": "mrkdwn", "text": "v: 1.2"}]},
+            {"type": "divider"},
+            {"type": "context", "elements": [
+                {"type": "image", "alt_text": "avatar"},
+                {"type": "mrkdwn", "text": "by bot"}
+            ]},
+            {"type": "image", "alt_text": "chart"},
+            {"type": "actions", "elements": [{"type": "button"}, {"type": "button"}]},
+            {"type": "input"},
+            {"type": "whatever"}
+        ]});
+        assert_eq!(
+            blocks_text(&m),
+            "Deploy | *ok* line2 | env: prod | v: 1.2 | avatar | by bot | chart | [actions:2]"
+        );
+    }
+
+    #[test]
+    fn blocks_empty_when_absent() {
+        assert_eq!(blocks_text(&json!({"text": "x"})), "");
+        assert_eq!(blocks_text(&json!({"blocks": [{"type": "divider"}]})), "");
+    }
+
+    fn select(m: &Value) -> String {
+        let mut text = m["text"].as_str().unwrap_or("").replace('\n', " ");
+        let blocks = blocks_text(m);
+        if text.is_empty() {
+            text = blocks;
+        } else if !blocks.is_empty() && blocks != text {
+            text.push_str(&format!(" [blocks: {blocks}]"));
+        }
+        text
+    }
+
+    #[test]
+    fn text_falls_back_to_blocks_and_skips_duplicates() {
+        let section = json!([{"type": "section", "text": {"type": "mrkdwn", "text": "hello"}}]);
+        assert_eq!(select(&json!({"text": "", "blocks": section})), "hello");
+        assert_eq!(
+            select(&json!({"text": "hello", "blocks": section})),
+            "hello"
+        );
+        assert_eq!(
+            select(&json!({"text": "stub", "blocks": section})),
+            "stub [blocks: hello]"
+        );
+        assert_eq!(select(&json!({"text": "plain"})), "plain");
+    }
+
+    #[test]
+    fn attachment_compact() {
+        let a = json!({
+            "pretext": "pre\ntext",
+            "title": "T",
+            "title_link": "https://l",
+            "text": "body\nmore",
+            "fields": [{"title": "K", "value": "v\n2"}, {"value": "only"}]
+        });
+        assert_eq!(
+            attachment_text(&a),
+            "pre text | T\thttps://l | body more | K: v 2 | : only"
+        );
+        assert_eq!(
+            attachment_text(&json!({"from_url": "https://u"})),
+            "https://u"
+        );
+        assert_eq!(attachment_text(&json!({})), "");
+    }
 }
