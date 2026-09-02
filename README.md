@@ -94,6 +94,20 @@ scli write sync                                          # refresh id<->name cac
 scli write update [--check]                              # self-update to latest release
 ```
 
+### JSON output
+
+Add the global `--json` flag to any `read` command to get NDJSON: one compact
+raw Slack record per line (the message, channel, user, file/attachment or
+search match object exactly as the API returned it), so fields the text format
+omits (`thread_ts`, `edited`, `is_private`, `permalink`, file ids, …) stay
+reachable. `read ls` emits `{"kind":"chan"|"user","id":…,"name":…}` and
+`read workspaces` emits `{"name":…,"default":bool}`. Empty results print
+nothing. Text output is unchanged when the flag is absent.
+
+```
+scli read messages '#general' -l 50 --json | jq -r 'select(.thread_ts) | .ts'
+```
+
 `<channel>` accepts a raw ID (`C…/G…/D…`), `#name`, or `@user` (→ DM).
 `<user>` accepts `Uxxxx`, a `name`, or a display name. Text args fall back to
 stdin when omitted or given as `-`.
@@ -163,7 +177,8 @@ Drop this into your `CLAUDE.md` so an agent uses `scli` instead of a Slack MCP:
 > `scli read search '<query>'` (Slack modifiers like `in:#chan from:@user` work;
 > on a `rate limited — retry after Ns` error, wait that long before retrying),
 > post with `scli write send`, react with `scli write react`. Output is
-> `ID<TAB>...` lines — cheap to parse.
+> `ID<TAB>...` lines — cheap to parse; add `--json` to any read for one raw
+> Slack record per line (NDJSON) when you need fields the text omits.
 
 ## License
 
