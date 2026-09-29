@@ -72,12 +72,12 @@ sandbox can gate access with two prefixes (`scli read` / `scli write`).
 
 ```
 # read tier (nothing mutates Slack)
-scli read channels [--type public|private|dm|mpim|all]   # ID<TAB>NAME mapping
+scli read channels [--type public|private|dm|mpim|all]   # ID<TAB>NAME mapping (DMs as dm:@user)
 scli read users                                          # ID<TAB>NAME<TAB>REAL_NAME
 scli read workspaces                                     # configured workspaces
-scli read messages <channel> [-l N]                      # recent messages
-scli read thread   <channel> <ts>                        # thread replies
-scli read dm       <@user> [-l N]                        # DM history
+scli read messages <channel> [-l N]                      # TS<TAB>USER<TAB>TEXT
+scli read thread   <channel> <ts>                        # thread replies, same format
+scli read dm       <@user> [-l N]                        # DM history, same format
 scli read files    <channel> <ts> [--download DIR]       # list/fetch uploaded files + link attachments
 scli read draft    <channel> [text|-] [--thread ts]      # compose locally, no send
 scli read ls       <query>                               # search cached channels+users
@@ -86,6 +86,7 @@ scli read search   <query> [-l N] [--sort score|timestamp]  # full-text message 
 # write tier (changes Slack or local creds)
 scli write send   <channel> [text|-] [--thread ts] [-f FILE ...]
 scli write react  <channel> <ts> <emoji>
+scli write delete <channel> <ts>                         # chat.delete; prints deleted<TAB>ID<TAB>TS
 scli write remind list                                   # DEPRECATED by Slack
 scli write remind add "text" --at "in 30 minutes"        # DEPRECATED by Slack
 scli write auth    <name> <token> [--cookie xoxd-…]      # save a workspace
@@ -93,6 +94,19 @@ scli write default <name>                                # set default workspace
 scli write sync                                          # refresh id<->name cache
 scli write update [--check]                              # self-update to latest release
 ```
+
+### Output contract
+
+Text output is one record per line, columns separated by a single TAB, so
+`cut -f`/`awk -F'\t'` split it reliably even when message text contains runs
+of spaces. Empty results print nothing on stdout; a `no messages`/`no channels`
+style note goes to **stderr** and the exit code stays 0, so `| wc -l` is a true
+count and `cut -f1` never sees a fake id. Message text is flattened to one line;
+inline tags (`[thread:N]`, `[files:N]`, `[att: …]`) never contain a TAB.
+
+Exit codes: `0` success (including empty results), `1` any error, `3` Slack
+rate limit (HTTP 429 or `ratelimited`) — branch on `$?` rather than parsing the
+stderr text, which still names the `Retry-After` when Slack sends one.
 
 ### JSON output
 
@@ -118,6 +132,7 @@ stdin when omitted or given as `-`.
 scli write send '#general' 'deploy finished ✅'
 echo "$REPORT" | scli write send @alice -
 scli write react '#general' 1700000000.000100 thumbsup
+scli write delete '#general' 1700000000.000100
 scli read messages '#general' -l 50 | grep deploy
 scli write send '#release' 'logs attached' -f build.log
 ```
@@ -131,8 +146,11 @@ scli write send '#release' 'logs attached' -f build.log
   straight into `scli read thread <CHANNEL_ID> <TS>`. Requires the `search:read`
   scope and a **user** token (xoxp-/xoxc-; bot tokens can't search). The endpoint
   is rate-limited (Tier 2, ~20 req/min); scli never sleeps or retries — on 429 it
-  exits non-zero with `rate limited — retry after Ns` so a calling agent knows to
-  wait.
+  exits with code 3 so a calling agent knows to wait (see *Output contract*).
+- **Delete** (`write delete`) calls `chat.delete` and only removes messages the
+  token may delete: your own with a user token, the bot's own with a bot token.
+  Thread replies have their own `ts`. Slack errors (`cant_delete_message`,
+  `message_not_found`, `channel_not_found`) are printed as-is.
 - **Drafts** aren't a public Slack API — `scli read draft` only composes the
   `chat.postMessage` payload locally and prints it as JSON for inspection; it
   never sends. To post, call `scli write send` with the same arguments (`send`
@@ -146,9 +164,9 @@ scli write send '#release' 'logs attached' -f build.log
   `files` and the `attachments` array (link unfurls, bot/app rich cards whose
   body lives in `title`/`title_link`/`text`/`fields`). `read messages`/`read
   thread`/`read dm` tag messages with `[files:N]` and render each attachment
-  inline as `[att: pretext | title<TAB>link | text | field: value]`; `scli read
-  files` lists both, printing each link attachment as a compact `attachment\t…`
-  line. `--download` fetches uploaded files only.
+  inline as `[att: pretext | title link | text | field: value]`; `scli read
+  files` lists both, printing each link attachment as a compact
+  `attachment<TAB>pretext | title<TAB>link | …` line. `--download` fetches uploaded files only.
 - **Block Kit**: bot/app messages usually carry their content in `blocks`, with
   an empty or stub `text`. `read messages`/`read thread`/`read dm` flatten
   section/header/context/rich_text/image blocks to one line (parts joined with
@@ -157,8 +175,8 @@ scli write send '#release' 'logs attached' -f build.log
   `[blocks: …]`. One physical line per message is always preserved, e.g.
 
   ```
-  1700000000.000100  B0BOT  Deploy | *ok* | env: prod [att: Build #12\thttps://ci/12 | passed]
-  1700000000.000200  U0ALICE  see the thread [thread:3] [blocks: see the thread | :tada:]
+  1700000000.000100<TAB>B0BOT<TAB>Deploy | *ok* | env: prod [att: Build #12 https://ci/12 | passed]
+  1700000000.000200<TAB>U0ALICE<TAB>see the thread [thread:3] [blocks: see the thread | :tada:]
   ```
 - **Self-update**: `scli write update` replaces the running binary in place with the
   matching asset from the latest GitHub release (Linux amd64/arm64, macOS arm64),
@@ -175,10 +193,11 @@ Drop this into your `CLAUDE.md` so an agent uses `scli` instead of a Slack MCP:
 > `read` or `write` tier. Read with `scli read messages/thread/dm`, map names with
 > `scli read channels`/`scli read users`, search message content with
 > `scli read search '<query>'` (Slack modifiers like `in:#chan from:@user` work;
-> on a `rate limited — retry after Ns` error, wait that long before retrying),
-> post with `scli write send`, react with `scli write react`. Output is
-> `ID<TAB>...` lines — cheap to parse; add `--json` to any read for one raw
-> Slack record per line (NDJSON) when you need fields the text omits.
+> exit code 3 means rate limited — wait before retrying), post with
+> `scli write send`, react with `scli write react`, remove your own message with
+> `scli write delete <channel> <ts>`. Output is TAB-separated lines, empty
+> results print nothing on stdout; add `--json` to any read for one raw Slack
+> record per line (NDJSON) when you need fields the text omits.
 
 ## License
 

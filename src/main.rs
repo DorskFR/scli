@@ -166,6 +166,14 @@ enum WriteCmd {
         emoji: String,
     },
 
+    /// Delete a message (chat.delete); thread replies have their own ts.
+    Delete {
+        /// Channel ID (C…/G…/D…) or #name / @user.
+        channel: String,
+        /// Message ts, e.g. 1700000000.000100.
+        ts: String,
+    },
+
     /// Reminders (DEPRECATED by Slack since 2023 — may stop working).
     #[command(subcommand)]
     Remind(Remind),
@@ -268,7 +276,7 @@ fn main() {
             .fg_color(Some(anstyle::AnsiColor::Red.into()))
             .bold();
         anstream::eprintln!("{red}error:{red:#} {e:#}");
-        std::process::exit(1);
+        std::process::exit(exit_code(&e));
     }
 }
 
@@ -344,6 +352,7 @@ fn run() -> Result<()> {
                 file,
             } => c.send(&channel, read_text(text)?, thread, &file),
             WriteCmd::React { channel, ts, emoji } => c.react(&channel, &ts, &emoji),
+            WriteCmd::Delete { channel, ts } => c.delete(&channel, &ts),
             WriteCmd::Remind(Remind::List) => c.remind_list(),
             WriteCmd::Remind(Remind::Add { text, at }) => c.remind_add(&text, &at),
             WriteCmd::Sync => c.sync(),
@@ -474,6 +483,11 @@ impl Client {
 
     fn channels(&self, kind: ChannelType, filter: Option<&str>) -> Result<()> {
         let types = kind.api_types();
+        let users = if types.contains("im") {
+            self.maps(false)?.users
+        } else {
+            Vec::new()
+        };
         let mut cursor = String::new();
         let mut n = 0;
         loop {
@@ -488,10 +502,10 @@ impl Client {
             )?;
             for ch in v["channels"].as_array().unwrap_or(&vec![]).iter() {
                 let id = ch["id"].as_str().unwrap_or("");
-                let name = ch["name"]
-                    .as_str()
-                    .map(str::to_string)
-                    .unwrap_or_else(|| format!("dm:{}", ch["user"].as_str().unwrap_or("?")));
+                let name = match ch["name"].as_str() {
+                    Some(n) => n.to_string(),
+                    None => dm_label(ch["user"].as_str().unwrap_or("?"), &users),
+                };
                 if filter.map(|q| contains_ci(&name, q)).unwrap_or(true) {
                     if self.json {
                         emit_json(ch)?;
@@ -507,7 +521,7 @@ impl Client {
             }
         }
         if n == 0 && !self.json {
-            println!("no channels");
+            eprintln!("no channels");
         }
         Ok(())
     }
@@ -576,14 +590,12 @@ impl Client {
             return emit_json_all(msgs.iter().rev());
         }
         if msgs.is_empty() {
-            println!("no messages");
+            eprintln!("no messages");
             return Ok(());
         }
         // history returns newest-first; show oldest-first for readability.
         for m in msgs.iter().rev() {
-            let ts = m["ts"].as_str().unwrap_or("");
-            let user = m["user"].as_str().or(m["bot_id"].as_str()).unwrap_or("?");
-            println!("{ts}  {user}  {}", message_text(m));
+            println!("{}", message_line(m));
         }
         Ok(())
     }
@@ -607,7 +619,7 @@ impl Client {
             emit_json_all(matches.iter())?;
         } else {
             if matches.is_empty() {
-                println!("no matches");
+                eprintln!("no matches");
                 return Ok(());
             }
             for m in &matches {
@@ -651,7 +663,7 @@ impl Client {
                 return Ok(());
             }
         } else if files.is_empty() && attachments.is_empty() {
-            println!("no files or attachments");
+            eprintln!("no files or attachments");
             return Ok(());
         }
         // Link/rich attachments (unfurls, bot/app cards): content lives in the
@@ -773,6 +785,13 @@ impl Client {
         Ok(())
     }
 
+    fn delete(&self, channel: &str, ts: &str) -> Result<()> {
+        let id = self.resolve_channel(channel)?;
+        self.call("chat.delete", &[("channel", &id), ("ts", ts)])?;
+        println!("deleted\t{id}\t{ts}");
+        Ok(())
+    }
+
     // --- reminders (deprecated) ------------------------------------------
 
     fn remind_list(&self) -> Result<()> {
@@ -780,7 +799,7 @@ impl Client {
         let v = self.call("reminders.list", &[])?;
         let rs = v["reminders"].as_array().cloned().unwrap_or_default();
         if rs.is_empty() {
-            println!("no reminders");
+            eprintln!("no reminders");
             return Ok(());
         }
         for r in &rs {
@@ -914,7 +933,7 @@ impl Client {
             }
         }
         if n == 0 && !self.json {
-            println!("no match for '{query}'");
+            eprintln!("no match for '{query}'");
         }
         Ok(())
     }
@@ -1113,6 +1132,14 @@ fn is_channel_id(s: &str) -> bool {
     is_slack_id(s, &['C', 'G', 'D'])
 }
 
+/// `dm:@name` when the user is in the cache, else the raw id.
+fn dm_label(user_id: &str, users: &[Usr]) -> String {
+    match users.iter().find(|u| u.id == user_id) {
+        Some(u) => format!("dm:@{}", u.name),
+        None => format!("dm:{user_id}"),
+    }
+}
+
 fn is_user_id(s: &str) -> bool {
     is_slack_id(s, &['U', 'W'])
 }
@@ -1136,6 +1163,13 @@ fn next_cursor(v: &Value) -> String {
         .to_string()
 }
 
+/// `TS<TAB>USER<TAB>TEXT` — the `read messages`/`thread`/`dm` record.
+fn message_line(m: &Value) -> String {
+    let ts = m["ts"].as_str().unwrap_or("");
+    let user = m["user"].as_str().or(m["bot_id"].as_str()).unwrap_or("?");
+    format!("{ts}\t{user}\t{}", message_text(m))
+}
+
 /// One-line rendering of a message body: `text` (falling back to blocks, or
 /// appending them when they differ) plus thread/reaction/file/attachment tags.
 fn message_text(m: &Value) -> String {
@@ -1157,7 +1191,7 @@ fn message_text(m: &Value) -> String {
         text.push_str(&format!(" [files:{}]", files.len()));
     }
     for a in m["attachments"].as_array().into_iter().flatten() {
-        let att = attachment_text(a);
+        let att = attachment_text(a).replace('\t', " ");
         if !att.is_empty() {
             text.push_str(&format!(" [att: {att}]"));
         }
@@ -1284,6 +1318,28 @@ fn rich_text_walk(elements: &Value, out: &mut String) {
     }
 }
 
+/// HTTP 429 or `ratelimited`; `main` maps it to exit code 3.
+#[derive(Debug)]
+struct RateLimited(String);
+
+impl std::fmt::Display for RateLimited {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for RateLimited {}
+
+const EXIT_RATE_LIMITED: i32 = 3;
+
+fn exit_code(e: &anyhow::Error) -> i32 {
+    if e.chain().any(|c| c.downcast_ref::<RateLimited>().is_some()) {
+        EXIT_RATE_LIMITED
+    } else {
+        1
+    }
+}
+
 /// Parse a Slack Web API response: enforce `ok: true`.
 fn read(resp: Result<ureq::Response, ureq::Error>, method: &str) -> Result<Value> {
     let body = match resp {
@@ -1295,7 +1351,10 @@ fn read(resp: Result<ureq::Response, ureq::Error>, method: &str) -> Result<Value
                 .header("retry-after")
                 .map(|s| format!("{s}s"))
                 .unwrap_or_else(|| "a bit".into());
-            bail!("{method}: rate limited (HTTP 429) — retry after {wait}");
+            return Err(RateLimited(format!(
+                "{method}: rate limited (HTTP 429) — retry after {wait}"
+            ))
+            .into());
         }
         Err(ureq::Error::Status(code, r)) => {
             let txt = r.into_string().unwrap_or_default();
@@ -1309,7 +1368,10 @@ fn read(resp: Result<ureq::Response, ureq::Error>, method: &str) -> Result<Value
     if !v["ok"].as_bool().unwrap_or(false) {
         let err = v["error"].as_str().unwrap_or("unknown_error");
         if err == "ratelimited" {
-            bail!("{method}: rate limited — wait ~60s before retrying");
+            return Err(RateLimited(format!(
+                "{method}: rate limited — wait ~60s before retrying"
+            ))
+            .into());
         }
         bail!("{method}: {err}");
     }
@@ -1384,7 +1446,7 @@ fn workspaces(json: bool) -> Result<()> {
             }
         }
         _ if json => {}
-        _ => println!("no workspaces"),
+        _ => eprintln!("no workspaces"),
     }
     Ok(())
 }
@@ -1888,6 +1950,60 @@ mod tests {
         assert_eq!(find_sum(sums, "scli-darwin-arm64").as_deref(), Some("eeff"));
         assert_eq!(find_sum(sums, "scli-linux"), None);
         assert_eq!(find_sum("", "scli-linux-amd64"), None);
+    }
+
+    #[test]
+    fn message_line_is_tab_separated_and_inline_attachment_has_no_tab() {
+        let m = json!({
+            "ts": "1700000000.000100",
+            "user": "U1",
+            "text": "a  b",
+            "attachments": [{"title": "Build", "title_link": "https://ci/1"}]
+        });
+        let line = message_line(&m);
+        assert_eq!(
+            line,
+            "1700000000.000100\tU1\ta  b [att: Build https://ci/1]"
+        );
+        assert_eq!(line.matches('\t').count(), 2);
+        assert_eq!(
+            message_line(&json!({"ts": "1.2", "bot_id": "B1", "text": "x"})),
+            "1.2\tB1\tx"
+        );
+    }
+
+    #[test]
+    fn dm_label_resolves_cached_users() {
+        let users = vec![Usr {
+            id: "U1".into(),
+            name: "alice".into(),
+            real: String::new(),
+            display: String::new(),
+        }];
+        assert_eq!(dm_label("U1", &users), "dm:@alice");
+        assert_eq!(dm_label("U9", &users), "dm:U9");
+    }
+
+    #[test]
+    fn rate_limited_maps_to_exit_code_3() {
+        let e: anyhow::Error = RateLimited("x: rate limited".into()).into();
+        assert_eq!(exit_code(&e), 3);
+        assert_eq!(exit_code(&e.context("outer")), 3);
+        assert_eq!(exit_code(&anyhow!("boom")), 1);
+    }
+
+    #[test]
+    fn delete_command_parses() {
+        let cli = Cli::try_parse_from(["scli", "write", "delete", "#general", "1700000000.000100"])
+            .unwrap();
+        match cli.cmd {
+            Cmd::Write(WriteCmd::Delete { channel, ts }) => {
+                assert_eq!(channel, "#general");
+                assert_eq!(ts, "1700000000.000100");
+            }
+            _ => panic!("expected write delete"),
+        }
+        assert!(Cli::try_parse_from(["scli", "write", "delete", "#general"]).is_err());
     }
 
     #[test]
