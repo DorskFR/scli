@@ -565,18 +565,45 @@ impl Client {
 
     fn read(&self, channel: &str, limit: u32) -> Result<()> {
         let id = self.resolve_channel(channel)?;
-        let lim = limit.to_string();
-        let v = self.call(
-            "conversations.history",
-            &[("channel", &id), ("limit", &lim)],
-        )?;
-        self.print_messages(&v)
+        let msgs =
+            self.paged_messages("conversations.history", &[("channel", &id)], Some(limit))?;
+        self.print_messages(&msgs)
     }
 
     fn thread(&self, channel: &str, ts: &str) -> Result<()> {
         let id = self.resolve_channel(channel)?;
-        let v = self.call("conversations.replies", &[("channel", &id), ("ts", ts)])?;
-        self.print_messages(&v)
+        let msgs = self.paged_messages(
+            "conversations.replies",
+            &[("channel", &id), ("ts", ts)],
+            None,
+        )?;
+        self.print_messages(&msgs)
+    }
+
+    /// Follow `next_cursor` until exhausted or `max` messages collected. Slack
+    /// may under-fill a page, and `conversations.replies` repeats the parent on
+    /// every page, so pages are merged with `merge_page`.
+    fn paged_messages(
+        &self,
+        method: &str,
+        params: &[(&str, &str)],
+        max: Option<u32>,
+    ) -> Result<Vec<Value>> {
+        let mut acc: Vec<Value> = Vec::new();
+        let mut cursor = String::new();
+        loop {
+            let lim = page_limit(acc.len(), max).to_string();
+            let mut p = params.to_vec();
+            p.push(("limit", &lim));
+            if !cursor.is_empty() {
+                p.push(("cursor", &cursor));
+            }
+            let v = self.call(method, &p)?;
+            cursor = next_cursor(&v);
+            if !merge_page(&mut acc, &v, max) || cursor.is_empty() {
+                return Ok(acc);
+            }
+        }
     }
 
     fn dm(&self, user: &str, limit: u32) -> Result<()> {
@@ -589,8 +616,8 @@ impl Client {
         self.read(&id, limit)
     }
 
-    fn print_messages(&self, v: &Value) -> Result<()> {
-        let msgs = chronological(v);
+    fn print_messages(&self, msgs: &[Value]) -> Result<()> {
+        let msgs = chronological(msgs);
         if self.json {
             return emit_json_all(msgs.iter());
         }
@@ -653,11 +680,7 @@ impl Client {
             "conversations.replies",
             &[("channel", &id), ("ts", ts), ("limit", "1")],
         )?;
-        let msg = v["messages"]
-            .as_array()
-            .and_then(|a| a.first())
-            .cloned()
-            .ok_or_else(|| anyhow!("message not found"))?;
+        let msg = message_with_ts(&v, ts).ok_or_else(|| anyhow!("message not found"))?;
         let files = msg["files"].as_array().cloned().unwrap_or_default();
         let attachments = msg["attachments"].as_array().cloned().unwrap_or_default();
         if self.json {
@@ -1166,9 +1189,50 @@ fn next_cursor(v: &Value) -> String {
         .to_string()
 }
 
+const PAGE_MAX: u32 = 1000;
+
+/// Page size for the next request: what is still missing, capped at Slack's max.
+fn page_limit(have: usize, max: Option<u32>) -> u32 {
+    match max {
+        Some(m) => m.saturating_sub(have as u32).clamp(1, PAGE_MAX),
+        None => PAGE_MAX,
+    }
+}
+
+/// Append a page's messages to `acc`, skipping ts already seen and stopping at
+/// `max`. Returns `false` when nothing more should be fetched.
+fn merge_page(acc: &mut Vec<Value>, page: &Value, max: Option<u32>) -> bool {
+    let Some(msgs) = page["messages"].as_array() else {
+        return false;
+    };
+    if msgs.is_empty() {
+        return false;
+    }
+    for m in msgs {
+        if max.is_some_and(|m| acc.len() >= m as usize) {
+            return false;
+        }
+        let ts = m["ts"].as_str().unwrap_or("");
+        if !ts.is_empty() && acc.iter().any(|a| a["ts"].as_str() == Some(ts)) {
+            continue;
+        }
+        acc.push(m.clone());
+    }
+    !max.is_some_and(|m| acc.len() >= m as usize)
+}
+
+/// The message whose ts was asked for; the first one if Slack returned no exact match.
+fn message_with_ts(v: &Value, ts: &str) -> Option<Value> {
+    let msgs = v["messages"].as_array()?;
+    msgs.iter()
+        .find(|m| m["ts"].as_str() == Some(ts))
+        .or_else(|| msgs.first())
+        .cloned()
+}
+
 /// Messages oldest-first: history is newest-first, replies oldest-first.
-fn chronological(v: &Value) -> Vec<Value> {
-    let mut msgs = v["messages"].as_array().cloned().unwrap_or_default();
+fn chronological(msgs: &[Value]) -> Vec<Value> {
+    let mut msgs = msgs.to_vec();
     msgs.sort_by_key(|m| ts_key(m["ts"].as_str().unwrap_or("")));
     msgs
 }
@@ -2354,7 +2418,7 @@ mod tests {
     #[test]
     fn chronological_orders_history_and_replies_oldest_first() {
         let ts = |v: &Value| -> Vec<String> {
-            chronological(v)
+            chronological(v["messages"].as_array().unwrap())
                 .iter()
                 .map(|m| m["ts"].as_str().unwrap().to_string())
                 .collect()
@@ -2368,7 +2432,7 @@ mod tests {
         let replies = json!({"messages": [{"ts": want[0]}, {"ts": want[1]}, {"ts": want[2]}]});
         assert_eq!(ts(&history), want);
         assert_eq!(ts(&replies), want);
-        assert!(chronological(&json!({})).is_empty());
+        assert!(chronological(&[]).is_empty());
         assert!(ts_key("1700000000.000100") < ts_key("1700000000.000200"));
         assert!(ts_key("999999999.999999") < ts_key("1000000000.000000"));
         assert_eq!(ts_key(""), (0, 0));
@@ -2395,5 +2459,67 @@ mod tests {
         ));
         let cli = Cli::try_parse_from(["scli", "read", "dm", "@a", "-l", "50"]).unwrap();
         assert!(matches!(cli.cmd, Cmd::Read(ReadCmd::Dm { limit: 50, .. })));
+    }
+
+    #[test]
+    fn page_limit_requests_only_what_is_missing() {
+        assert_eq!(page_limit(0, None), 1000);
+        assert_eq!(page_limit(999, None), 1000);
+        assert_eq!(page_limit(0, Some(20)), 20);
+        assert_eq!(page_limit(15, Some(20)), 5);
+        assert_eq!(page_limit(20, Some(20)), 1);
+        assert_eq!(page_limit(0, Some(5000)), 1000);
+    }
+
+    #[test]
+    fn merge_page_dedupes_parent_and_stops_at_limit() {
+        let m = |ts: &str| json!({"ts": ts});
+        let parent = "1700000000.000100";
+        let mut acc = Vec::new();
+        let p1 = json!({"messages": [m(parent), m("1700000001.000000"), m("1700000002.000000")]});
+        let p2 = json!({"messages": [m(parent), m("1700000003.000000")]});
+        assert!(merge_page(&mut acc, &p1, None));
+        assert!(merge_page(&mut acc, &p2, None));
+        let got: Vec<&str> = acc.iter().map(|v| v["ts"].as_str().unwrap()).collect();
+        assert_eq!(
+            got,
+            [
+                parent,
+                "1700000001.000000",
+                "1700000002.000000",
+                "1700000003.000000"
+            ]
+        );
+        assert!(!merge_page(&mut acc, &json!({"messages": []}), None));
+        assert!(!merge_page(&mut acc, &json!({}), None));
+        assert_eq!(acc.len(), 4);
+
+        let mut acc = Vec::new();
+        assert!(merge_page(&mut acc, &p1, Some(5)));
+        assert!(!merge_page(&mut acc, &p2, Some(4)));
+        assert_eq!(acc.len(), 4);
+        let mut acc = Vec::new();
+        assert!(!merge_page(&mut acc, &p1, Some(2)));
+        assert_eq!(acc.len(), 2);
+        assert!(!merge_page(&mut acc, &p2, Some(2)));
+        assert_eq!(acc.len(), 2);
+    }
+
+    #[test]
+    fn message_with_ts_prefers_exact_match() {
+        let v = json!({"messages": [
+            {"ts": "1700000000.000100", "files": [{"id": "F1"}]},
+            {"ts": "1700000000.000200", "files": [{"id": "F2"}]}
+        ]});
+        assert_eq!(
+            message_with_ts(&v, "1700000000.000200").unwrap()["files"][0]["id"],
+            "F2"
+        );
+        assert_eq!(
+            message_with_ts(&v, "1700000000.000999").unwrap()["files"][0]["id"],
+            "F1"
+        );
+        assert!(message_with_ts(&json!({"messages": []}), "x").is_none());
+        assert!(message_with_ts(&json!({}), "x").is_none());
     }
 }
