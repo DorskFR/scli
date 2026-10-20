@@ -528,6 +528,7 @@ impl Client {
 
     fn users(&self, filter: Option<&str>) -> Result<()> {
         let mut cursor = String::new();
+        let mut n = 0;
         loop {
             let v = self.call("users.list", &[("limit", "200"), ("cursor", &cursor)])?;
             for u in v["members"].as_array().unwrap_or(&vec![]).iter() {
@@ -546,12 +547,16 @@ impl Client {
                     } else {
                         println!("{id}\t{name}\t{real}");
                     }
+                    n += 1;
                 }
             }
             cursor = next_cursor(&v);
             if cursor.is_empty() {
                 break;
             }
+        }
+        if n == 0 && !self.json {
+            eprintln!("no users");
         }
         Ok(())
     }
@@ -585,16 +590,15 @@ impl Client {
     }
 
     fn print_messages(&self, v: &Value) -> Result<()> {
-        let msgs = v["messages"].as_array().cloned().unwrap_or_default();
+        let msgs = chronological(v);
         if self.json {
-            return emit_json_all(msgs.iter().rev());
+            return emit_json_all(msgs.iter());
         }
         if msgs.is_empty() {
             eprintln!("no messages");
             return Ok(());
         }
-        // history returns newest-first; show oldest-first for readability.
-        for m in msgs.iter().rev() {
+        for m in &msgs {
             println!("{}", message_line(m));
         }
         Ok(())
@@ -645,7 +649,6 @@ impl Client {
 
     fn files(&self, channel: &str, ts: &str, download: Option<PathBuf>) -> Result<()> {
         let id = self.resolve_channel(channel)?;
-        // fetch the single message via replies(limit could include parent); use history around ts
         let v = self.call(
             "conversations.replies",
             &[("channel", &id), ("ts", ts), ("limit", "1")],
@@ -1161,6 +1164,18 @@ fn next_cursor(v: &Value) -> String {
         .as_str()
         .unwrap_or("")
         .to_string()
+}
+
+/// Messages oldest-first: history is newest-first, replies oldest-first.
+fn chronological(v: &Value) -> Vec<Value> {
+    let mut msgs = v["messages"].as_array().cloned().unwrap_or_default();
+    msgs.sort_by_key(|m| ts_key(m["ts"].as_str().unwrap_or("")));
+    msgs
+}
+
+fn ts_key(ts: &str) -> (u64, u64) {
+    let (secs, frac) = ts.split_once('.').unwrap_or((ts, ""));
+    (secs.parse().unwrap_or(0), frac.parse().unwrap_or(0))
 }
 
 /// `TS<TAB>USER<TAB>TEXT` — the `read messages`/`thread`/`dm` record.
@@ -2334,6 +2349,36 @@ mod tests {
         assert_eq!(serde_json::from_str::<Value>(&line).unwrap(), v);
         emit_json(&v).unwrap();
         emit_json_all([v.clone(), v].iter()).unwrap();
+    }
+
+    #[test]
+    fn chronological_orders_history_and_replies_oldest_first() {
+        let ts = |v: &Value| -> Vec<String> {
+            chronological(v)
+                .iter()
+                .map(|m| m["ts"].as_str().unwrap().to_string())
+                .collect()
+        };
+        let want = [
+            "1700000000.000100",
+            "1700000000.000200",
+            "1700000100.000001",
+        ];
+        let history = json!({"messages": [{"ts": want[2]}, {"ts": want[1]}, {"ts": want[0]}]});
+        let replies = json!({"messages": [{"ts": want[0]}, {"ts": want[1]}, {"ts": want[2]}]});
+        assert_eq!(ts(&history), want);
+        assert_eq!(ts(&replies), want);
+        assert!(chronological(&json!({})).is_empty());
+        assert!(ts_key("1700000000.000100") < ts_key("1700000000.000200"));
+        assert!(ts_key("999999999.999999") < ts_key("1000000000.000000"));
+        assert_eq!(ts_key(""), (0, 0));
+    }
+
+    #[test]
+    fn session_token_requires_cookie() {
+        assert!(Client::new("xoxc-1".into(), None, "w".into()).is_err());
+        assert!(Client::new("xoxc-1".into(), Some("xoxd-1".into()), "w".into()).is_ok());
+        assert!(Client::new("xoxp-1".into(), None, "w".into()).is_ok());
     }
 
     #[test]
