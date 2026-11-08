@@ -13,6 +13,13 @@ use serde_json::Value;
 
 const API: &str = "https://slack.com/api";
 
+/// Slack Web API base URL; `SCLI_API_URL` overrides it (mock servers, proxies).
+fn api_base(env: Option<String>) -> String {
+    env.filter(|s| !s.is_empty())
+        .map(|s| s.trim_end_matches('/').to_string())
+        .unwrap_or_else(|| API.to_string())
+}
+
 #[derive(Parser)]
 #[command(
     version,
@@ -457,7 +464,8 @@ impl Client {
 
     /// POST application/x-www-form-urlencoded (the Slack Web API convention).
     fn call(&self, method: &str, params: &[(&str, &str)]) -> Result<Value> {
-        let mut req = ureq::post(&format!("{API}/{method}"))
+        let base = api_base(std::env::var("SCLI_API_URL").ok());
+        let mut req = ureq::post(&format!("{base}/{method}"))
             .set("Authorization", &format!("Bearer {}", self.token));
         if let Some(c) = &self.cookie {
             req = req.set("Cookie", &format!("d={c}"));
@@ -1817,6 +1825,16 @@ fn safe_file_name(name: &str, id: &str) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn api_base_defaults_to_slack_and_honours_override() {
+        assert_eq!(api_base(None), "https://slack.com/api");
+        assert_eq!(api_base(Some(String::new())), "https://slack.com/api");
+        assert_eq!(
+            api_base(Some("http://127.0.0.1:18432/api/".into())),
+            "http://127.0.0.1:18432/api"
+        );
+    }
 
     #[test]
     fn slack_id_predicates() {
