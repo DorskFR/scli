@@ -6,7 +6,7 @@ Slack CLI for coding agents: one static binary, one user token, one TAB-separate
 [![CI](https://github.com/DorskFR/scli/actions/workflows/ci.yml/badge.svg)](https://github.com/DorskFR/scli/actions/workflows/ci.yml)
 [![license](https://img.shields.io/github/license/DorskFR/scli)](LICENSE)
 
-![scli listing channels, reading #deploys, searching and posting against a mock workspace](docs/assets/demo.gif)
+![scli listing channels, reading #deploys, searching and posting](docs/assets/demo.gif)
 
 Replaces a Slack MCP server for agents. Authenticates with a token from the environment; runs no OAuth flow and no daemon.
 
@@ -111,10 +111,6 @@ read for one raw Slack record per line (NDJSON).
 ```sh
 git clone https://github.com/DorskFR/scli && cd scli
 cargo test
-
-# regenerate docs/assets/demo.gif against the mock server in docs/demo/
-cargo build --release
-docker run --rm -v "$PWD:/vhs" ghcr.io/charmbracelet/vhs docs/demo.tape
 ```
 
 ## License
