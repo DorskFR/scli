@@ -2,7 +2,7 @@
 name = "scli"
 version = "0.6.7"
 edition = "2021"
-description = "Token-frugal Slack CLI for coding agents"
+description = "Slack CLI for coding agents: one static binary, one user token, one TAB-separated record per line."
 license = "MIT"
 
 [dependencies]
