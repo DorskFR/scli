@@ -1283,7 +1283,7 @@ fn message_text(m: &Value) -> String {
             text.push_str(&format!(" [att: {att}]"));
         }
     }
-    text
+    text.trim_start().to_string()
 }
 
 fn reactions_str(m: &Value) -> String {
@@ -1328,6 +1328,16 @@ fn attachment_text(a: &Value) -> String {
         let t = f["title"].as_str().unwrap_or("");
         let val = f["value"].as_str().unwrap_or("").replace('\n', " ");
         parts.push(format!("{t}: {val}").trim().to_string());
+    }
+    let blocks = blocks_text(a);
+    if !blocks.is_empty() && !parts.contains(&blocks) {
+        parts.push(blocks);
+    }
+    if parts.is_empty() {
+        let fallback = a["fallback"].as_str().unwrap_or("").replace('\n', " ");
+        if !fallback.is_empty() {
+            parts.push(fallback);
+        }
     }
     parts.join(" | ")
 }
@@ -2013,6 +2023,32 @@ mod tests {
             "hi [thread:3] [eyes:2 +1:0] [files:2] [att: T]"
         );
         assert_eq!(message_text(&json!({})), "");
+    }
+
+    #[test]
+    fn attachment_blocks_and_fallback_are_rendered() {
+        let m = json!({
+            "ts": "1.2",
+            "user": "U1",
+            "text": "",
+            "attachments": [{
+                "color": "#E01E5A",
+                "fallback": "fb",
+                "blocks": [
+                    {"type": "section", "text": {"type": "mrkdwn", "text": "*failed* · <https://x/1|PR 1>"}},
+                    {"type": "context", "elements": [{"type": "mrkdwn", "text": "run #3"}]}
+                ]
+            }]
+        });
+        assert_eq!(
+            message_line(&m),
+            "1.2\tU1\t[att: *failed* · <https://x/1|PR 1> | run #3]"
+        );
+        assert_eq!(attachment_text(&json!({"fallback": "only fb"})), "only fb");
+        assert_eq!(
+            attachment_text(&json!({"title": "T", "fallback": "fb"})),
+            "T"
+        );
     }
 
     #[test]
