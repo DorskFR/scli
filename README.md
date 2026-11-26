@@ -1,3 +1,5 @@
+<img src="docs/assets/icon.svg" width="64" height="64" alt="">
+
 # scli
 
 Slack CLI for coding agents: one static binary, one user token, one TAB-separated record per line.
