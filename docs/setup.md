@@ -8,7 +8,7 @@
 |---|---|
 | `channels:read`, `channels:history` | public channels |
 | `groups:read`, `groups:history` | private channels |
-| `im:read`, `im:history`, `im:write` | DMs (`read dm` opens the conversation) |
+| `im:read`, `im:history` | DMs (`read dm`, `read messages @user`); add `im:write` for `write send @user` |
 | `mpim:read`, `mpim:history` | group DMs |
 | `users:read` | user lookup |
 | `chat:write` | `write send`, `write delete` |
@@ -52,4 +52,4 @@ scli --workspace myteam read channels
 
 Resolution order: `SLACK_TOKEN` (with `SLACK_COOKIE`) wins unless `--workspace` is passed; then the configured default; then the only stored workspace, if there is exactly one.
 
-The id↔name cache lives under `~/.cache/scli/` (`$XDG_CACHE_HOME` is honoured), one file per workspace. `scli write sync` refreshes it.
+The id↔name cache lives under `~/.cache/scli/` (`$XDG_CACHE_HOME` is honoured), one file per workspace. Channels, users and DMs are cached separately for an hour; a lookup that misses refetches only the directory it needs. `scli write sync` refreshes channels and users now.
