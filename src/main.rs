@@ -529,7 +529,8 @@ impl Client {
 
     /// GET a file URL; the token and session cookie go only to Slack-owned hosts.
     fn get_bytes(&self, url: &str) -> Result<Vec<u8>> {
-        let auth = is_slack_file_host(url).then_some((self.token.as_str(), self.cookie.as_deref()));
+        let auth = file_auth_allowed(url, api_override().as_deref())
+            .then_some((self.token.as_str(), self.cookie.as_deref()));
         fetch_file(url, auth)
     }
 
@@ -764,7 +765,7 @@ impl Client {
             match &download {
                 None if self.json => {}
                 None => println!("{name}\t{url}"),
-                Some(dir) => match download_url(f) {
+                Some(dir) => match download_url(f, api_override().as_deref()) {
                     Err(reason) => {
                         if self.json {
                             emit_json(&serde_json::json!({
@@ -1992,34 +1993,58 @@ fn shared_ts(v: &Value) -> Option<String> {
         .find_map(|p| p["ts"].as_str().map(str::to_string))
 }
 
-/// True for `https://` URLs on `slack.com`, `slack-files.com` or their subdomains.
-fn is_slack_file_host(url: &str) -> bool {
-    let Some(rest) = url.strip_prefix("https://") else {
-        return false;
-    };
+/// Lowercased `(scheme, host)` of an http(s) URL; `None` for anything else,
+/// including URLs with userinfo or unusual host characters.
+fn url_origin(url: &str) -> Option<(&'static str, String)> {
+    let (scheme, rest) = ["https", "http"]
+        .into_iter()
+        .find_map(|sch| Some((sch, url.strip_prefix(sch)?.strip_prefix("://")?)))?;
     let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
     if authority.contains('@') {
-        return false;
+        return None;
     }
     let host = match authority.rsplit_once(':') {
         Some((h, port)) if port.chars().all(|c| c.is_ascii_digit()) => h,
         _ => authority,
     }
     .to_ascii_lowercase();
-    if !host
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
-    {
-        return false;
+    let valid = !host.is_empty()
+        && host
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-');
+    valid.then_some((scheme, host))
+}
+
+/// True for `https://` URLs on `slack.com`, `slack-files.com` or their subdomains.
+fn is_slack_file_host(url: &str) -> bool {
+    match url_origin(url) {
+        Some(("https", host)) => ["slack.com", "slack-files.com"]
+            .iter()
+            .any(|d| host == *d || host.ends_with(&format!(".{d}"))),
+        _ => false,
     }
-    ["slack.com", "slack-files.com"]
-        .iter()
-        .any(|d| host == *d || host.ends_with(&format!(".{d}")))
+}
+
+/// The `SCLI_API_URL` override, when set: its host already receives the token.
+fn api_override() -> Option<String> {
+    std::env::var("SCLI_API_URL").ok().filter(|s| !s.is_empty())
+}
+
+/// Whether a file URL may receive the credentials: a Slack file host, or the
+/// same scheme and host as the configured API base override.
+fn file_auth_allowed(url: &str, api_base: Option<&str>) -> bool {
+    is_slack_file_host(url)
+        || api_base
+            .and_then(url_origin)
+            .is_some_and(|base| url_origin(url) == Some(base))
 }
 
 /// The URL to download a Slack file from, or why it is skipped: external and
 /// remote files point at third-party hosts that must never see the credentials.
-fn download_url(f: &Value) -> std::result::Result<&str, &'static str> {
+fn download_url<'a>(
+    f: &'a Value,
+    api_base: Option<&str>,
+) -> std::result::Result<&'a str, &'static str> {
     if f["is_external"].as_bool().unwrap_or(false) || f["mode"].as_str() == Some("external") {
         return Err("external file");
     }
@@ -2030,7 +2055,7 @@ fn download_url(f: &Value) -> std::result::Result<&str, &'static str> {
     if url.is_empty() {
         return Err("no download url");
     }
-    if !is_slack_file_host(url) {
+    if !file_auth_allowed(url, api_base) {
         return Err("not a Slack file url");
     }
     Ok(url)
@@ -2263,27 +2288,72 @@ mod tests {
         }
     }
 
+    fn download_url_default(f: &Value) -> std::result::Result<&str, &'static str> {
+        download_url(f, None)
+    }
+
+    #[test]
+    fn file_auth_extends_to_the_api_base_host() {
+        let https = Some("https://slack.example.test/api");
+        assert!(file_auth_allowed(
+            "https://slack.example.test/files/a.png",
+            https
+        ));
+        assert!(file_auth_allowed(
+            "https://SLACK.example.test:8443/f",
+            https
+        ));
+        assert!(file_auth_allowed("https://files.slack.com/x", https));
+        assert!(!file_auth_allowed("http://slack.example.test/f", https));
+        assert!(!file_auth_allowed("https://other.example.test/f", https));
+        assert!(!file_auth_allowed("https://example.test/f", https));
+        assert!(!file_auth_allowed(
+            "https://slack.example.test@evil.test/f",
+            https
+        ));
+
+        let http = Some("http://127.0.0.1:18432/api");
+        assert!(file_auth_allowed("http://127.0.0.1:18432/files/a", http));
+        assert!(!file_auth_allowed("https://127.0.0.1/files/a", http));
+        assert!(!file_auth_allowed("http://127.0.0.2:18432/files/a", http));
+
+        assert!(!file_auth_allowed("http://127.0.0.1:18432/files/a", None));
+        assert!(!file_auth_allowed("https://slack.example.test/f", None));
+        assert!(!file_auth_allowed("https://x.test/f", Some("not a url")));
+
+        let f = json!({"url_private": "http://127.0.0.1:18432/files/a"});
+        assert_eq!(download_url(&f, http), Ok("http://127.0.0.1:18432/files/a"));
+        assert_eq!(download_url(&f, None), Err("not a Slack file url"));
+        let ext = json!({"is_external": true, "url_private": "http://127.0.0.1:18432/f"});
+        assert_eq!(download_url(&ext, http), Err("external file"));
+    }
+
     #[test]
     fn external_and_foreign_files_are_not_downloaded() {
         let slack = "https://files.slack.com/files-pri/T1-F1/download/a.png";
         assert_eq!(
-            download_url(&json!({"url_private_download": slack})),
+            download_url_default(&json!({"url_private_download": slack})),
             Ok(slack)
         );
-        assert_eq!(download_url(&json!({"url_private": slack})), Ok(slack));
         assert_eq!(
-            download_url(&json!({"is_external": true, "url_private": slack})),
+            download_url_default(&json!({"url_private": slack})),
+            Ok(slack)
+        );
+        assert_eq!(
+            download_url_default(&json!({"is_external": true, "url_private": slack})),
             Err("external file")
         );
         assert_eq!(
-            download_url(&json!({"mode": "external", "url_private": "https://docs.example/1"})),
+            download_url_default(
+                &json!({"mode": "external", "url_private": "https://docs.example/1"})
+            ),
             Err("external file")
         );
         assert_eq!(
-            download_url(&json!({"url_private": "https://attacker.example/f"})),
+            download_url_default(&json!({"url_private": "https://attacker.example/f"})),
             Err("not a Slack file url")
         );
-        assert_eq!(download_url(&json!({})), Err("no download url"));
+        assert_eq!(download_url_default(&json!({})), Err("no download url"));
     }
 
     /// One-shot HTTP server on 127.0.0.1: answers each connection with the next
