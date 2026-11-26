@@ -23,7 +23,7 @@ scli write react  <channel> <ts> <emoji>
 scli write delete <channel> <ts>                         # chat.delete; prints deleted<TAB>ID<TAB>TS
 scli write remind list                                   # DEPRECATED by Slack
 scli write remind add "text" --at "in 30 minutes"        # DEPRECATED by Slack
-scli write auth    <name> <token> [--cookie xoxd-…]      # save a workspace
+scli write auth    <name> [token|-] [--cookie xoxd-…]    # save a workspace (token from stdin when omitted)
 scli write default <name>                                # set default workspace
 scli write sync                                          # refresh id<->name cache
 scli write update [--check]                              # self-update to latest release
@@ -57,6 +57,8 @@ scli read messages '#general' -l 50 --json | jq -r 'select(.thread_ts) | .ts'
 
 Output is `CHANNEL_ID<TAB>CHANNEL<TAB>TS<TAB>USER<TAB>TEXT`, so a hit feeds into `scli read thread <CHANNEL_ID> <TS>`.
 
+`-l` above 100 pages through the results (one request per 100 hits, capped at 1000).
+
 Requires the `search:read` scope and a user token (`xoxp-`/`xoxc-`; bot tokens cannot search). The endpoint is rate-limited (Tier 2, ~20 req/min). `scli` never sleeps or retries: on 429 it exits with code 3.
 
 ## Delete
@@ -75,7 +77,9 @@ Drafts are not a public Slack API. `read draft` composes the `chat.postMessage` 
 
 Uploads use `files.getUploadURLExternal` + `files.completeUploadExternal` (`files.upload` is deprecated).
 
-Slack messages carry two distinct things: uploaded `files`, and the `attachments` array (link unfurls, bot/app cards whose body lives in `title`/`title_link`/`text`/`fields`). `read messages`, `read thread` and `read dm` tag messages with `[files:N]` and render each attachment inline as `[att: pretext | title link | text | field: value]`. `read files` lists both, printing each link attachment as `attachment<TAB>pretext | title<TAB>link | …`. `--download` fetches uploaded files only.
+Slack messages carry two distinct things: uploaded `files`, and the `attachments` array (link unfurls, bot/app cards whose body lives in `title`/`title_link`/`text`/`fields`). `read messages`, `read thread` and `read dm` tag messages with `[files:N]` and render each attachment inline as `[att: pretext | title link | text | field: value]`. `read files` lists both, printing each link attachment as `attachment<TAB>pretext | title<TAB>link | …`. `--download` fetches uploaded files only. The token and session cookie are sent only to `https://` URLs on `slack.com` / `slack-files.com` hosts, or to URLs with the same scheme and host as `SCLI_API_URL` when it is set, and never follow a redirect; external and remote files (Google Drive and other `files.remote.add` shares) are reported as `skipped NAME<TAB>(external file)` instead. Existing files are never overwritten: a name that is taken gets the file id appended (`image-F0123.png`). With `--json`, the saved/skipped notes are NDJSON records too: `{"saved":PATH,"id":…}` / `{"skipped":NAME,"id":…,"reason":…}`.
+
+`@name` resolution matches the handle, display name or real name. A unique handle match wins; when several users match otherwise, the command fails listing the candidate ids instead of guessing.
 
 ## Block Kit
 
@@ -90,7 +94,7 @@ Bot/app messages usually carry their content in `blocks`, with an empty or stub 
 
 `write update` replaces the running binary in place with the matching asset from the latest GitHub release (Linux amd64/arm64, macOS arm64), after checking it against `SHA256SUMS`. `write update --check` only reports whether a newer version exists.
 
-Every other command prints a one-line "newer version available" notice to stderr (piped stdout stays clean), at most once per 24h. `SCLI_NO_UPDATE_CHECK=1` disables it.
+Every other command prints a one-line "newer version available" notice to stderr (piped stdout stays clean), at most once per 24h. The check uses a 2s timeout and a failed check (offline, GitHub unreachable or rate-limited) also counts, so it is not retried until the next day. `SCLI_NO_UPDATE_CHECK=1` disables it.
 
 ## Environment variables
 
