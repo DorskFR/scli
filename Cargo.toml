@@ -1,6 +1,6 @@
 [package]
 name = "scli"
-version = "0.6.8"
+version = "0.7.0"
 edition = "2021"
 description = "Slack CLI for coding agents: one static binary, one user token, one TAB-separated record per line."
 license = "MIT"

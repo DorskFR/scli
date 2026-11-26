@@ -126,8 +126,8 @@ enum ReadCmd {
     Search {
         /// Slack search query, modifiers included.
         query: String,
-        /// Max hits to return (Slack caps a search page at 100).
-        #[arg(short, long, default_value_t = 20)]
+        /// Max hits to return; above 100 pages through results (capped at 1000).
+        #[arg(short, long, default_value_t = 20, value_parser = search_limit)]
         limit: u32,
         /// Result order.
         #[arg(long, value_enum, default_value_t = SearchSort::Score)]
@@ -188,13 +188,15 @@ enum WriteCmd {
     /// Save a workspace to config.
     ///
     /// Use a normal token (xoxp-/xoxb-), or a browser-session token (xoxc-…)
-    /// together with --cookie <xoxd-…> copied from the Slack web client.
+    /// together with its `d` cookie (xoxd-…) copied from the Slack web client.
+    /// Pipe the token on stdin (`scli write auth myteam < token.txt`) to keep it
+    /// out of shell history and the process list.
     Auth {
         /// Workspace name to save under, e.g. myteam.
         name: String,
-        /// Slack token (xoxp-/xoxb-/xoxc-…).
-        token: String,
-        /// The `d` cookie (xoxd-…) required for an xoxc- session token.
+        /// Slack token (xoxp-/xoxb-/xoxc-…), or omit / "-" to read it from stdin.
+        token: Option<String>,
+        /// The `d` cookie (xoxd-…) for an xoxc- session token; defaults to $SLACK_COOKIE.
         #[arg(long)]
         cookie: Option<String>,
     },
@@ -275,6 +277,17 @@ fn history_limit(s: &str) -> Result<u32, String> {
     Ok(n.min(HISTORY_LIMIT_MAX))
 }
 
+const SEARCH_PAGE_MAX: u32 = 100;
+const SEARCH_LIMIT_MAX: u32 = 1000;
+
+fn search_limit(s: &str) -> Result<u32, String> {
+    let n: u32 = s.parse().map_err(|e| format!("{e}"))?;
+    if n == 0 {
+        return Err("must be at least 1".into());
+    }
+    Ok(n.min(SEARCH_LIMIT_MAX))
+}
+
 fn main() {
     if let Err(e) = run() {
         // Bold red "error:" via anstream: color is auto-stripped when stderr is
@@ -312,7 +325,21 @@ fn run() -> Result<()> {
             name,
             token,
             cookie,
-        }) => return auth(name, token, cookie.as_deref()),
+        }) => {
+            if token.as_deref().is_some_and(|t| t != "-") || cookie.is_some() {
+                eprintln!(
+                    "warning: credentials on the command line end up in shell history and the \
+                     process list; pipe the token on stdin and set SLACK_COOKIE instead"
+                );
+            }
+            let token = read_secret(token.clone())?;
+            let cookie = cookie.clone().or_else(|| {
+                std::env::var("SLACK_COOKIE")
+                    .ok()
+                    .filter(|c| !c.is_empty() && token.starts_with("xoxc-"))
+            });
+            return auth(name, &token, cookie.as_deref());
+        }
         Cmd::Read(ReadCmd::Workspaces) => return workspaces(cli.json),
         Cmd::Write(WriteCmd::Default { name }) => return set_default(name),
         Cmd::Read(ReadCmd::Draft {
@@ -391,6 +418,33 @@ fn read_text(arg: Option<String>) -> Result<String> {
         }
         Some(t) => Ok(t.to_string()),
     }
+}
+
+/// A secret from an arg, or from stdin when omitted / "-" (first line on a TTY).
+fn read_secret(arg: Option<String>) -> Result<String> {
+    use std::io::IsTerminal as _;
+    let raw = match arg.as_deref() {
+        Some("-") | None => {
+            let stdin = std::io::stdin();
+            let mut s = String::new();
+            if stdin.is_terminal() {
+                eprint!("token: ");
+                stdin.read_line(&mut s).context("reading token")?;
+            } else {
+                stdin
+                    .lock()
+                    .read_to_string(&mut s)
+                    .context("reading stdin")?;
+            }
+            s
+        }
+        Some(t) => t.to_string(),
+    };
+    let token = raw.trim().to_string();
+    if token.is_empty() {
+        bail!("no token given (pass it on stdin)");
+    }
+    Ok(token)
 }
 
 // ---------------------------------------------------------------------------
@@ -473,18 +527,10 @@ impl Client {
         read(req.send_form(params), method)
     }
 
-    /// GET an authenticated file URL (url_private), incl. the session cookie.
+    /// GET a file URL; the token and session cookie go only to Slack-owned hosts.
     fn get_bytes(&self, url: &str) -> Result<Vec<u8>> {
-        let mut req = ureq::get(url).set("Authorization", &format!("Bearer {}", self.token));
-        if let Some(c) = &self.cookie {
-            req = req.set("Cookie", &format!("d={c}"));
-        }
-        let resp = req.call().with_context(|| format!("GET {url}"))?;
-        let mut buf = Vec::new();
-        resp.into_reader()
-            .read_to_end(&mut buf)
-            .context("reading file body")?;
-        Ok(buf)
+        let auth = is_slack_file_host(url).then_some((self.token.as_str(), self.cookie.as_deref()));
+        fetch_file(url, auth)
     }
 
     // --- channels / users -------------------------------------------------
@@ -643,17 +689,19 @@ impl Client {
     /// Tier-2 rate limit (~20 req/min): a 429 is surfaced, never retried here.
     fn search(&self, query: &str, limit: u32, sort: SearchSort) -> Result<()> {
         let sort = sort.as_str();
-        // search.messages caps count at 100 per page; one page keeps us frugal
-        // with the Tier-2 budget, like `read messages` does with its one call.
-        let count = limit.clamp(1, 100).to_string();
-        let v = self.call(
-            "search.messages",
-            &[("query", query), ("count", &count), ("sort", sort)],
-        )?;
-        let matches = v["messages"]["matches"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default();
+        let count = limit.clamp(1, SEARCH_PAGE_MAX).to_string();
+        let (matches, total) = collect_search(limit, |page| {
+            let page = page.to_string();
+            self.call(
+                "search.messages",
+                &[
+                    ("query", query),
+                    ("count", &count),
+                    ("sort", sort),
+                    ("page", &page),
+                ],
+            )
+        })?;
         if self.json {
             emit_json_all(matches.iter())?;
         } else {
@@ -670,12 +718,8 @@ impl Client {
                 println!("{chan_id}\t{chan}\t{ts}\t{user}\t{text}");
             }
         }
-        let total = v["messages"]["total"].as_i64().unwrap_or(0);
-        if total > matches.len() as i64 {
-            eprintln!(
-                "showing {} of {total} matches (raise -l, or narrow the query)",
-                matches.len()
-            );
+        if let Some(hint) = search_hint(matches.len(), total, limit) {
+            eprintln!("{hint}");
         }
         Ok(())
     }
@@ -712,6 +756,7 @@ impl Client {
         }
         for f in &files {
             let name = f["name"].as_str().unwrap_or("file");
+            let fid = f["id"].as_str().unwrap_or("");
             let url = f["url_private_download"]
                 .as_str()
                 .or(f["url_private"].as_str())
@@ -719,14 +764,28 @@ impl Client {
             match &download {
                 None if self.json => {}
                 None => println!("{name}\t{url}"),
-                Some(_) if url.is_empty() => println!("skipped {name}\t(no download url)"),
-                Some(dir) => {
-                    let bytes = self.get_bytes(url)?;
-                    let path = dir.join(safe_file_name(name, f["id"].as_str().unwrap_or("")));
-                    std::fs::write(&path, bytes)
-                        .with_context(|| format!("writing {}", path.display()))?;
-                    println!("saved {}", path.display());
-                }
+                Some(dir) => match download_url(f) {
+                    Err(reason) => {
+                        if self.json {
+                            emit_json(&serde_json::json!({
+                                "skipped": name, "id": fid, "reason": reason
+                            }))?;
+                        } else {
+                            println!("skipped {name}\t({reason})");
+                        }
+                    }
+                    Ok(url) => {
+                        let bytes = self.get_bytes(url)?;
+                        let path = write_new_file(dir, &safe_file_name(name, fid), fid, &bytes)?;
+                        if self.json {
+                            emit_json(&serde_json::json!({
+                                "saved": path.display().to_string(), "id": fid
+                            }))?;
+                        } else {
+                            println!("saved {}", path.display());
+                        }
+                    }
+                },
             }
         }
         Ok(())
@@ -990,7 +1049,7 @@ impl Client {
         }
         // Cache-first: try fresh cache, and on a miss refetch once before failing.
         for force in [false, true] {
-            if let Some(id) = self.maps(force)?.find_channel(name) {
+            if let Some(id) = self.maps(force)?.find_channel(name)? {
                 return Ok(id);
             }
         }
@@ -1003,7 +1062,7 @@ impl Client {
             return Ok(name.to_string());
         }
         for force in [false, true] {
-            if let Some(id) = self.maps(force)?.find_user(name) {
+            if let Some(id) = self.maps(force)?.find_user(name)? {
                 return Ok(id);
             }
         }
@@ -1040,27 +1099,52 @@ impl Maps {
         now_secs().saturating_sub(self.fetched) < CACHE_TTL_SECS
     }
 
-    /// Case-insensitive name lookup, preferring an exact-case hit when several match.
-    fn find_channel(&self, name: &str) -> Option<String> {
-        pick(
-            self.channels
-                .iter()
-                .filter(|c| c.name.eq_ignore_ascii_case(name)),
-            |c| c.name == name,
-        )
-        .map(|c| c.id.clone())
+    /// Case-insensitive name lookup; an exact-case hit wins when several match,
+    /// otherwise several matches are an error listing the candidates.
+    fn find_channel(&self, name: &str) -> Result<Option<String>> {
+        let hits: Vec<&Chan> = self
+            .channels
+            .iter()
+            .filter(|c| c.name.eq_ignore_ascii_case(name))
+            .collect();
+        let exact: Vec<&Chan> = hits.iter().copied().filter(|c| c.name == name).collect();
+        let pick = match (hits.as_slice(), exact.as_slice()) {
+            ([], _) => return Ok(None),
+            ([one], _) | (_, [one]) => one,
+            _ => bail!(
+                "ambiguous channel '{name}': {}; pass the id",
+                candidates(hits.iter().map(|c| (&c.id, &c.name)))
+            ),
+        };
+        Ok(Some(pick.id.clone()))
     }
 
-    fn find_user(&self, name: &str) -> Option<String> {
-        let ci = |u: &&Usr| {
-            u.name.eq_ignore_ascii_case(name)
+    /// Match the handle, display name or real name case-insensitively. A unique
+    /// handle match wins; otherwise several distinct users are an error.
+    fn find_user(&self, name: &str) -> Result<Option<String>> {
+        let mut hits: Vec<&Usr> = Vec::new();
+        for u in &self.users {
+            let matched = u.name.eq_ignore_ascii_case(name)
                 || u.display.eq_ignore_ascii_case(name)
-                || u.real.eq_ignore_ascii_case(name)
+                || u.real.eq_ignore_ascii_case(name);
+            if matched && !hits.iter().any(|h| h.id == u.id) {
+                hits.push(u);
+            }
+        }
+        let handles: Vec<&Usr> = hits
+            .iter()
+            .copied()
+            .filter(|u| u.name.eq_ignore_ascii_case(name))
+            .collect();
+        let pick = match (hits.as_slice(), handles.as_slice()) {
+            ([], _) => return Ok(None),
+            ([one], _) | (_, [one]) => one,
+            _ => bail!(
+                "ambiguous user '{name}': {}; pass the id",
+                candidates(hits.iter().map(|u| (&u.id, &u.name)))
+            ),
         };
-        pick(self.users.iter().filter(ci), |u| {
-            u.name == name || u.display == name || u.real == name
-        })
-        .map(|u| u.id.clone())
+        Ok(Some(pick.id.clone()))
     }
 
     fn to_json(&self) -> Value {
@@ -1146,12 +1230,11 @@ fn save_maps(workspace: &str, m: &Maps) -> Result<()> {
     Ok(())
 }
 
-fn pick<'a, T>(it: impl Iterator<Item = &'a T>, exact: impl Fn(&T) -> bool) -> Option<&'a T> {
-    let hits: Vec<&T> = it.collect();
-    hits.iter()
-        .copied()
-        .find(|x| exact(x))
-        .or_else(|| hits.first().copied())
+/// `ID (name), ID (name)` for an ambiguity error.
+fn candidates<'a>(it: impl Iterator<Item = (&'a String, &'a String)>) -> String {
+    it.map(|(id, name)| format!("{id} ({name})"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Slack ids: one prefix letter followed by uppercase alphanumerics, 9+ chars total.
@@ -1227,6 +1310,48 @@ fn merge_page(acc: &mut Vec<Value>, page: &Value, max: Option<u32>) -> bool {
         acc.push(m.clone());
     }
     !max.is_some_and(|m| acc.len() >= m as usize)
+}
+
+/// Page through `search.messages` (1-based `page`, fixed page size) until
+/// `limit` hits are collected or Slack runs out. Returns the hits and the total.
+fn collect_search(
+    limit: u32,
+    mut fetch: impl FnMut(u32) -> Result<Value>,
+) -> Result<(Vec<Value>, i64)> {
+    let mut acc: Vec<Value> = Vec::new();
+    let mut total = 0;
+    let mut page = 1;
+    loop {
+        let v = fetch(page)?;
+        total = v["messages"]["total"].as_i64().unwrap_or(total);
+        let hits = v["messages"]["matches"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let empty = hits.is_empty();
+        acc.extend(hits);
+        let pages = v["messages"]["paging"]["pages"].as_u64().unwrap_or(1);
+        if empty || acc.len() >= limit as usize || u64::from(page) >= pages {
+            break;
+        }
+        page += 1;
+    }
+    acc.truncate(limit as usize);
+    Ok((acc, total))
+}
+
+/// Stderr note when more matches exist than were shown; suggests `-l` only
+/// while it can still raise the count.
+fn search_hint(shown: usize, total: i64, limit: u32) -> Option<String> {
+    if total <= shown as i64 {
+        return None;
+    }
+    let advice = if limit < SEARCH_LIMIT_MAX && (shown as u32) >= limit {
+        "raise -l, or narrow the query"
+    } else {
+        "narrow the query"
+    };
+    Some(format!("showing {shown} of {total} matches ({advice})"))
 }
 
 /// The message whose ts was asked for; the first one if Slack returned no exact match.
@@ -1496,20 +1621,64 @@ fn load_config() -> Result<Value> {
 }
 
 fn save_config(v: &Value) -> Result<()> {
-    let path = config_path()?;
-    std::fs::create_dir_all(path.parent().unwrap()).context("creating config dir")?;
-    std::fs::write(&path, serde_json::to_string_pretty(v)?).context("writing config")?;
+    write_private(&config_path()?, serde_json::to_string_pretty(v)?.as_bytes())
+}
+
+/// Atomically replace `path` with `bytes`, readable by the owner only: the
+/// directory is created 0700, the data goes to a 0600 temp file that is then
+/// renamed over `path`.
+fn write_private(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
+    let dir = path
+        .parent()
+        .ok_or_else(|| anyhow!("{} has no parent dir", path.display()))?;
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+        builder.mode(0o700);
+        opts.mode(0o600);
+    }
+    builder
+        .create(dir)
+        .with_context(|| format!("creating {}", dir.display()))?;
+    let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
+    let tmp = dir.join(format!(".{file_name}.tmp-{}", std::process::id()));
+    std::fs::remove_file(&tmp).ok();
+    let result = write_and_rename(&opts, &tmp, path, bytes);
+    if result.is_err() {
+        std::fs::remove_file(&tmp).ok();
+    }
+    result
+}
+
+fn write_and_rename(
+    opts: &std::fs::OpenOptions,
+    tmp: &std::path::Path,
+    path: &std::path::Path,
+    bytes: &[u8],
+) -> Result<()> {
+    use std::io::Write as _;
+    let mut f = opts
+        .open(tmp)
+        .with_context(|| format!("creating {}", tmp.display()))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).ok();
+        f.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("setting mode 0600 on {}", tmp.display()))?;
     }
-    Ok(())
+    f.write_all(bytes)
+        .and_then(|_| f.sync_all())
+        .with_context(|| format!("writing {}", tmp.display()))?;
+    std::fs::rename(tmp, path).with_context(|| format!("replacing {}", path.display()))
 }
 
 fn auth(name: &str, token: &str, cookie: Option<&str>) -> Result<()> {
     if token.starts_with("xoxc-") && cookie.is_none() {
-        bail!("xoxc- session token needs --cookie xoxd-… (copy the `d` cookie from the Slack web client)");
+        bail!("xoxc- session token needs --cookie xoxd-… or SLACK_COOKIE (copy the `d` cookie from the Slack web client)");
     }
     let mut cfg = load_config()?;
     if !cfg["servers"].is_object() {
@@ -1621,11 +1790,11 @@ fn newest_semver_release(releases: &Value) -> Option<&Value> {
 /// Fetch the newest semver release JSON from GitHub (short timeout, sends a
 /// User-Agent). `/releases/latest` is unusable: the rolling `latest` release
 /// shadows it.
-fn fetch_latest() -> Result<Value> {
+fn fetch_latest(timeout: std::time::Duration) -> Result<Value> {
     let resp = ureq::get(RELEASES_API)
         .set("User-Agent", UA)
         .set("Accept", "application/vnd.github+json")
-        .timeout(std::time::Duration::from_secs(10))
+        .timeout(timeout)
         .call();
     let releases: Value = match resp {
         Ok(r) => r.into_json().context("parsing releases JSON")?,
@@ -1643,7 +1812,7 @@ fn fetch_latest() -> Result<Value> {
 fn self_update(check_only: bool) -> Result<()> {
     let current = env!("CARGO_PKG_VERSION");
     let want = asset_name()?;
-    let rel = fetch_latest()?;
+    let rel = fetch_latest(std::time::Duration::from_secs(10))?;
     let tag = rel["tag_name"]
         .as_str()
         .ok_or_else(|| anyhow!("release has no tag_name"))?;
@@ -1766,20 +1935,17 @@ fn update_notice() {
     let latest = if now.saturating_sub(last) < 86_400 {
         cached["latest"].as_str().map(str::to_string)
     } else {
-        let tag = fetch_latest()
+        let tag = fetch_latest(UPDATE_NOTICE_TIMEOUT)
             .ok()
             .and_then(|r| r["tag_name"].as_str().map(str::to_string));
-        if let (Ok(p), Some(t)) = (&cache, &tag) {
+        let entry = update_cache_entry(&cached, now, tag);
+        if let Ok(p) = &cache {
             if let Some(parent) = p.parent() {
                 std::fs::create_dir_all(parent).ok();
             }
-            std::fs::write(
-                p,
-                serde_json::json!({ "checked": now, "latest": t }).to_string(),
-            )
-            .ok();
+            std::fs::write(p, entry.to_string()).ok();
         }
-        tag
+        entry["latest"].as_str().map(str::to_string)
     };
 
     if let Some(t) = latest {
@@ -1790,6 +1956,15 @@ fn update_notice() {
             );
         }
     }
+}
+
+const UPDATE_NOTICE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The cache record after a check at `now`: a failed check (`fetched` = None)
+/// still counts as a check and keeps the previously known latest tag.
+fn update_cache_entry(cached: &Value, now: u64, fetched: Option<String>) -> Value {
+    let latest = fetched.or_else(|| cached["latest"].as_str().map(str::to_string));
+    serde_json::json!({ "checked": now, "latest": latest })
 }
 
 fn update_cache_path() -> Result<PathBuf> {
@@ -1815,6 +1990,116 @@ fn shared_ts(v: &Value) -> Option<String> {
         .filter_map(|posts| posts.as_array())
         .flat_map(|posts| posts.iter())
         .find_map(|p| p["ts"].as_str().map(str::to_string))
+}
+
+/// True for `https://` URLs on `slack.com`, `slack-files.com` or their subdomains.
+fn is_slack_file_host(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("https://") else {
+        return false;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if authority.contains('@') {
+        return false;
+    }
+    let host = match authority.rsplit_once(':') {
+        Some((h, port)) if port.chars().all(|c| c.is_ascii_digit()) => h,
+        _ => authority,
+    }
+    .to_ascii_lowercase();
+    if !host
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+    {
+        return false;
+    }
+    ["slack.com", "slack-files.com"]
+        .iter()
+        .any(|d| host == *d || host.ends_with(&format!(".{d}")))
+}
+
+/// The URL to download a Slack file from, or why it is skipped: external and
+/// remote files point at third-party hosts that must never see the credentials.
+fn download_url(f: &Value) -> std::result::Result<&str, &'static str> {
+    if f["is_external"].as_bool().unwrap_or(false) || f["mode"].as_str() == Some("external") {
+        return Err("external file");
+    }
+    let url = f["url_private_download"]
+        .as_str()
+        .or(f["url_private"].as_str())
+        .unwrap_or("");
+    if url.is_empty() {
+        return Err("no download url");
+    }
+    if !is_slack_file_host(url) {
+        return Err("not a Slack file url");
+    }
+    Ok(url)
+}
+
+/// GET `url`, sending `auth` (token, optional `d` cookie) on the first request
+/// only; ureq drops both headers on any redirect.
+fn fetch_file(url: &str, auth: Option<(&str, Option<&str>)>) -> Result<Vec<u8>> {
+    let agent = ureq::AgentBuilder::new()
+        .redirect_auth_headers(ureq::RedirectAuthHeaders::Never)
+        .build();
+    let mut req = agent.get(url);
+    if let Some((token, cookie)) = auth {
+        req = req.set("Authorization", &format!("Bearer {token}"));
+        if let Some(c) = cookie {
+            req = req.set("Cookie", &format!("d={c}"));
+        }
+    }
+    let resp = req.call().with_context(|| format!("GET {url}"))?;
+    let mut buf = Vec::new();
+    resp.into_reader()
+        .read_to_end(&mut buf)
+        .context("reading file body")?;
+    Ok(buf)
+}
+
+/// `stem-ID.ext` (or `stem-ID-N.ext` for n > 0), the fallback when `name` is taken.
+fn suffixed_name(name: &str, id: &str, n: u32) -> String {
+    let (stem, ext) = match name.rsplit_once('.') {
+        Some((s, e)) if !s.is_empty() => (s, Some(e)),
+        _ => (name, None),
+    };
+    let mut out = match (id.is_empty(), n) {
+        (true, n) => format!("{stem}-{}", n + 1),
+        (false, 0) => format!("{stem}-{id}"),
+        (false, n) => format!("{stem}-{id}-{n}"),
+    };
+    if let Some(e) = ext {
+        out.push('.');
+        out.push_str(e);
+    }
+    out
+}
+
+/// Write `bytes` to a file in `dir` that did not exist before, never replacing
+/// one: `name`, then `stem-ID.ext`, then `stem-ID-N.ext`.
+fn write_new_file(dir: &std::path::Path, name: &str, id: &str, bytes: &[u8]) -> Result<PathBuf> {
+    use std::io::Write as _;
+    for n in 0..1000 {
+        let path = if n == 0 {
+            dir.join(name)
+        } else {
+            dir.join(suffixed_name(name, id, n - 1))
+        };
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut f) => {
+                f.write_all(bytes)
+                    .with_context(|| format!("writing {}", path.display()))?;
+                return Ok(path);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e).with_context(|| format!("creating {}", path.display())),
+        }
+    }
+    bail!("no free file name for '{name}' in {}", dir.display())
 }
 
 /// Basename of a Slack-supplied filename, so a payload cannot escape the
@@ -1905,15 +2190,342 @@ mod tests {
                 u("U02ABCDEF", "wendy", "Wendy Wu", ""),
             ],
         };
-        assert_eq!(m.find_channel("dev").as_deref(), Some("C02ABCDEF"));
-        assert_eq!(m.find_channel("Dev").as_deref(), Some("C01ABCDEF"));
-        assert_eq!(m.find_channel("DEV").as_deref(), Some("C01ABCDEF"));
-        assert_eq!(m.find_channel("general"), None);
-        assert_eq!(m.find_user("Alice").as_deref(), Some("U01ABCDEF"));
-        assert_eq!(m.find_user("ALICE").as_deref(), Some("U01ABCDEF"));
-        assert_eq!(m.find_user("alice smith").as_deref(), Some("U01ABCDEF"));
-        assert_eq!(m.find_user("Wendy").as_deref(), Some("U02ABCDEF"));
-        assert_eq!(m.find_user("bob"), None);
+        let ch = |n: &str| m.find_channel(n).unwrap();
+        let us = |n: &str| m.find_user(n).unwrap();
+        assert_eq!(ch("dev").as_deref(), Some("C02ABCDEF"));
+        assert_eq!(ch("Dev").as_deref(), Some("C01ABCDEF"));
+        assert_eq!(ch("general"), None);
+        assert_eq!(us("Alice").as_deref(), Some("U01ABCDEF"));
+        assert_eq!(us("ALICE").as_deref(), Some("U01ABCDEF"));
+        assert_eq!(us("alice smith").as_deref(), Some("U01ABCDEF"));
+        assert_eq!(us("Wendy").as_deref(), Some("U02ABCDEF"));
+        assert_eq!(us("bob"), None);
+        let err = m.find_channel("DEV").unwrap_err().to_string();
+        assert!(err.contains("C01ABCDEF (Dev)") && err.contains("C02ABCDEF (dev)"));
+    }
+
+    #[test]
+    fn ambiguous_user_names_are_an_error_unless_a_handle_is_unique() {
+        let u = |id: &str, name: &str, real: &str, display: &str| Usr {
+            id: id.into(),
+            name: name.into(),
+            real: real.into(),
+            display: display.into(),
+        };
+        let m = Maps {
+            fetched: 0,
+            channels: vec![],
+            users: vec![
+                u("U01ABCDEF", "alex.k", "Alex Kim", "Alex"),
+                u("U02ABCDEF", "alex.m", "Alex Moe", "alex"),
+                u("U03ABCDEF", "sam", "Sam Lee", "jo"),
+                u("U04ABCDEF", "jo", "Jo Park", ""),
+                u("U04ABCDEF", "jo", "Jo Park", ""),
+            ],
+        };
+        let err = m.find_user("alex").unwrap_err().to_string();
+        assert_eq!(
+            err,
+            "ambiguous user 'alex': U01ABCDEF (alex.k), U02ABCDEF (alex.m); pass the id"
+        );
+        assert!(m.find_user("Alex").is_err());
+        assert_eq!(m.find_user("jo").unwrap().as_deref(), Some("U04ABCDEF"));
+        assert_eq!(m.find_user("alex.m").unwrap().as_deref(), Some("U02ABCDEF"));
+        assert_eq!(
+            m.find_user("Alex Kim").unwrap().as_deref(),
+            Some("U01ABCDEF")
+        );
+    }
+
+    #[test]
+    fn file_auth_only_for_slack_https_hosts() {
+        for ok in [
+            "https://files.slack.com/files-pri/T1-F1/download/a.png",
+            "https://slack.com/x",
+            "https://FILES.Slack.com:443/x",
+            "https://x.slack-files.com/y",
+            "https://files.slack.com?x=1",
+        ] {
+            assert!(is_slack_file_host(ok), "{ok}");
+        }
+        for bad in [
+            "http://files.slack.com/x",
+            "https://files.slack.com.evil.example/x",
+            "https://evilslack.com/x",
+            "https://drive.google.com/file/d/1",
+            "https://files.slack.com@evil.example/x",
+            "https://evil.example/?u=https://files.slack.com",
+            "https://evil.example\\.slack.com/x",
+            "files.slack.com/x",
+            "",
+        ] {
+            assert!(!is_slack_file_host(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn external_and_foreign_files_are_not_downloaded() {
+        let slack = "https://files.slack.com/files-pri/T1-F1/download/a.png";
+        assert_eq!(
+            download_url(&json!({"url_private_download": slack})),
+            Ok(slack)
+        );
+        assert_eq!(download_url(&json!({"url_private": slack})), Ok(slack));
+        assert_eq!(
+            download_url(&json!({"is_external": true, "url_private": slack})),
+            Err("external file")
+        );
+        assert_eq!(
+            download_url(&json!({"mode": "external", "url_private": "https://docs.example/1"})),
+            Err("external file")
+        );
+        assert_eq!(
+            download_url(&json!({"url_private": "https://attacker.example/f"})),
+            Err("not a Slack file url")
+        );
+        assert_eq!(download_url(&json!({})), Err("no download url"));
+    }
+
+    /// One-shot HTTP server on 127.0.0.1: answers each connection with the next
+    /// canned response and sends the raw request head back over the channel.
+    fn http_server(
+        responses: Vec<String>,
+    ) -> (
+        String,
+        std::sync::mpsc::Receiver<String>,
+        std::thread::JoinHandle<()>,
+    ) {
+        use std::io::{BufRead as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            for resp in responses {
+                let (mut sock, _) = listener.accept().unwrap();
+                let mut reader = std::io::BufReader::new(sock.try_clone().unwrap());
+                let mut head = String::new();
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
+                        break;
+                    }
+                    head.push_str(&line);
+                }
+                tx.send(head).unwrap();
+                sock.write_all(resp.as_bytes()).unwrap();
+            }
+        });
+        (base, rx, handle)
+    }
+
+    #[test]
+    fn non_slack_file_urls_get_no_credentials() {
+        let ok = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nhi".to_string();
+        let (base, rx, h) = http_server(vec![ok]);
+        let c = Client::new("xoxc-secret".into(), Some("xoxd-secret".into()), "w".into()).unwrap();
+        assert_eq!(c.get_bytes(&format!("{base}/f")).unwrap(), b"hi");
+        let head = rx.recv().unwrap().to_ascii_lowercase();
+        h.join().unwrap();
+        assert!(!head.contains("authorization"), "{head}");
+        assert!(!head.contains("cookie"), "{head}");
+        assert!(!head.contains("secret"), "{head}");
+    }
+
+    #[test]
+    fn file_credentials_do_not_follow_redirects() {
+        let ok = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_string();
+        let (target, rx2, h2) = http_server(vec![ok]);
+        let redirect = format!(
+            "HTTP/1.1 302 Found\r\nLocation: {target}/next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        let (base, rx1, h1) = http_server(vec![redirect]);
+        let got = fetch_file(
+            &format!("{base}/f"),
+            Some(("xoxc-secret", Some("xoxd-secret"))),
+        );
+        assert_eq!(got.unwrap(), b"ok");
+        let first = rx1.recv().unwrap().to_ascii_lowercase();
+        let second = rx2.recv().unwrap().to_ascii_lowercase();
+        h1.join().unwrap();
+        h2.join().unwrap();
+        assert!(
+            first.contains("authorization: bearer xoxc-secret"),
+            "{first}"
+        );
+        assert!(first.contains("cookie: d=xoxd-secret"), "{first}");
+        assert!(!second.contains("secret"), "{second}");
+    }
+
+    fn scratch_dir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("scli-test-{tag}-{}", std::process::id()));
+        std::fs::remove_dir_all(&d).ok();
+        d
+    }
+
+    #[test]
+    fn downloads_never_overwrite_existing_files() {
+        let dir = scratch_dir("dl");
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = write_new_file(&dir, "image.png", "F1", b"one").unwrap();
+        let b = write_new_file(&dir, "image.png", "F2", b"two").unwrap();
+        let c = write_new_file(&dir, "image.png", "F2", b"three").unwrap();
+        let d = write_new_file(&dir, "README", "", b"four").unwrap();
+        let e = write_new_file(&dir, "README", "", b"five").unwrap();
+        let f = write_new_file(&dir, "README", "", b"six").unwrap();
+        let names: Vec<String> = [&a, &b, &c, &d, &e, &f]
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "image.png",
+                "image-F2.png",
+                "image-F2-1.png",
+                "README",
+                "README-1",
+                "README-2"
+            ]
+        );
+        assert_eq!(std::fs::read(&a).unwrap(), b"one");
+        assert_eq!(std::fs::read(&b).unwrap(), b"two");
+        assert_eq!(std::fs::read(&c).unwrap(), b"three");
+        assert_eq!(std::fs::read(&f).unwrap(), b"six");
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(suffixed_name(".bashrc", "F1", 0), ".bashrc-F1");
+        assert_eq!(suffixed_name("a.tar.gz", "F1", 2), "a.tar-F1-2.gz");
+    }
+
+    #[test]
+    fn private_config_is_written_0600_atomically() {
+        let dir = scratch_dir("cfg");
+        let path = dir.join("scli").join("config.json");
+        write_private(&path, b"{\"a\":1}").unwrap();
+        write_private(&path, b"{\"a\":2}").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"{\"a\":2}");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode =
+                |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode(&path), 0o600);
+            assert_eq!(mode(path.parent().unwrap()), 0o700);
+        }
+        let leftovers: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(leftovers, [std::ffi::OsString::from("config.json")]);
+        let blocked = dir.join("file");
+        std::fs::write(&blocked, b"x").unwrap();
+        assert!(write_private(&blocked.join("config.json"), b"{}").is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn auth_token_is_optional_on_argv() {
+        let parse = |args: &[&str]| match Cli::try_parse_from(args).unwrap().cmd {
+            Cmd::Write(WriteCmd::Auth {
+                name,
+                token,
+                cookie,
+            }) => (name, token, cookie),
+            _ => panic!("expected write auth"),
+        };
+        assert_eq!(
+            parse(&["scli", "write", "auth", "t"]),
+            ("t".into(), None, None)
+        );
+        assert_eq!(
+            parse(&["scli", "write", "auth", "t", "-"]).1.as_deref(),
+            Some("-")
+        );
+        assert_eq!(
+            parse(&["scli", "write", "auth", "t", "xoxc-1", "--cookie", "xoxd-1"]),
+            ("t".into(), Some("xoxc-1".into()), Some("xoxd-1".into()))
+        );
+        assert_eq!(read_secret(Some(" xoxp-1\n".into())).unwrap(), "xoxp-1");
+        assert!(read_secret(Some("  ".into())).is_err());
+    }
+
+    #[test]
+    fn failed_update_checks_are_cached_too() {
+        let prev = json!({"checked": 1, "latest": "v0.6.8"});
+        assert_eq!(
+            update_cache_entry(&prev, 100, None),
+            json!({"checked": 100, "latest": "v0.6.8"})
+        );
+        assert_eq!(
+            update_cache_entry(&prev, 100, Some("v0.7.0".into())),
+            json!({"checked": 100, "latest": "v0.7.0"})
+        );
+        assert_eq!(
+            update_cache_entry(&Value::Null, 100, None),
+            json!({"checked": 100, "latest": null})
+        );
+        assert!(UPDATE_NOTICE_TIMEOUT <= std::time::Duration::from_secs(2));
+    }
+
+    #[test]
+    fn search_pages_up_to_the_limit() {
+        let page = |n: usize, total: i64, pages: u64| {
+            json!({"messages": {
+                "total": total,
+                "paging": {"pages": pages},
+                "matches": (0..n).map(|i| json!({"ts": i.to_string()})).collect::<Vec<_>>()
+            }})
+        };
+        let mut asked = Vec::new();
+        let (hits, total) = collect_search(250, |p| {
+            asked.push(p);
+            Ok(page(100, 900, 9))
+        })
+        .unwrap();
+        assert_eq!((hits.len(), total), (250, 900));
+        assert_eq!(asked, [1, 2, 3]);
+
+        let mut asked = Vec::new();
+        let (hits, _) = collect_search(500, |p| {
+            asked.push(p);
+            Ok(if p < 2 {
+                page(100, 130, 2)
+            } else {
+                page(30, 130, 2)
+            })
+        })
+        .unwrap();
+        assert_eq!((hits.len(), asked.len()), (130, 2));
+
+        let (hits, _) = collect_search(20, |_| Ok(page(20, 20, 1))).unwrap();
+        assert_eq!(hits.len(), 20);
+        let (hits, _) = collect_search(300, |_| Ok(page(0, 0, 0))).unwrap();
+        assert!(hits.is_empty());
+
+        assert_eq!(search_limit("500"), Ok(500));
+        assert_eq!(search_limit("5000"), Ok(1000));
+        assert!(search_limit("0").is_err());
+        let cli = Cli::try_parse_from(["scli", "read", "search", "q", "-l", "250"]).unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Cmd::Read(ReadCmd::Search { limit: 250, .. })
+        ));
+    }
+
+    #[test]
+    fn search_hint_only_suggests_raising_l_when_it_helps() {
+        assert_eq!(search_hint(20, 20, 20), None);
+        assert_eq!(
+            search_hint(20, 500, 20).as_deref(),
+            Some("showing 20 of 500 matches (raise -l, or narrow the query)")
+        );
+        assert_eq!(
+            search_hint(1000, 5000, 1000).as_deref(),
+            Some("showing 1000 of 5000 matches (narrow the query)")
+        );
+        assert_eq!(
+            search_hint(130, 140, 500).as_deref(),
+            Some("showing 130 of 140 matches (narrow the query)")
+        );
     }
 
     #[test]

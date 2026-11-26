@@ -17,3 +17,14 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
       - run: cargo build --release
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - run: docker build -t scli:ci .
+      - name: image completes a TLS handshake with slack.com
+        run: |
+          out=$(docker run --rm -e SCLI_NO_UPDATE_CHECK=1 -e SLACK_TOKEN=xoxp-invalid scli:ci read channels 2>&1 || true)
+          echo "$out"
+          echo "$out" | grep -q invalid_auth
