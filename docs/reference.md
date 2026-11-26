@@ -18,7 +18,7 @@ scli read ls       <query>                               # search cached channel
 scli read search   <query> [-l N] [--sort score|timestamp]  # full-text message search
 
 # write tier (changes Slack or local creds)
-scli write send   <channel> [text|-] [--thread ts] [-f FILE ...]
+scli write send   <channel> [text|-] [--thread ts] [-f FILE ...] [--raw] [--allow-broadcast]
 scli write react  <channel> <ts> <emoji>
 scli write delete <channel> <ts>                         # chat.delete; prints deleted<TAB>ID<TAB>TS
 scli write remind list                                   # DEPRECATED by Slack
@@ -29,11 +29,23 @@ scli write sync                                          # refresh id<->name cac
 scli write update [--check]                              # self-update to latest release
 ```
 
-`<channel>` accepts a raw ID (`C…/G…/D…`), `#name`, or `@user` (→ DM). `<user>` accepts `Uxxxx`, a `name`, or a display name. Text arguments fall back to stdin when omitted or given as `-`.
+`<channel>` accepts a raw ID (`C…/G…/D…`), `#name`, or `@user` (→ DM). `<user>` accepts `Uxxxx`, a `name`, or a display name. Text arguments fall back to stdin when omitted or given as `-`, and may start with a hyphen (`"- item"`, `"-1"`).
+
+Read commands never create a DM: `@user` in the read tier (and `read dm`) uses the existing DM found via `conversations.list types=im` (needs `im:read`) and fails with `no DM with @user` when there is none. Only `write send/react/delete @user` call `conversations.open`.
+
+## Sending text
+
+`write send` escapes `&`, `<` and `>` (Slack's formatting rules) so the message shows exactly what was written, e.g. `Vec<String>` or `a<b`. Existing `&amp;`/`&lt;`/`&gt;` entities are left alone, and well-formed `<@U…>`, `<#C…>`, `<https://…|label>`, `<mailto:…>` and `<!date^…>` stay live. Broadcast mentions (`<!here>`, `<!channel>`, `<!everyone>`, `<!subteam^…>`) are sent as plain text, with a note on stderr, unless `--allow-broadcast` is passed. `--raw` sends the text verbatim as Slack markup (the behaviour before 0.8.0). A plain `@name` is not turned into a mention; use `<@U…>`. The same applies to the comment of a file upload.
 
 ## Output contract
 
-Text output is one record per line, columns separated by a single TAB, so `cut -f` and `awk -F'\t'` split it even when message text contains runs of spaces. Message text is flattened to one line; inline tags (`[thread:N]`, `[files:N]`, `[att: …]`) never contain a TAB.
+Text output is one record per line, columns separated by a single TAB, so `cut -f` and `awk -F'\t'` split it even when message text contains runs of spaces. Message text is flattened to one line (TAB, CR and LF inside a field become spaces); inline tags (`[thread:N]`, `[files:N]`, `[att: …]`) never contain a TAB.
+
+Text output (and error messages) never pass terminal control sequences through: control characters other than TAB/newline and bidi overrides are printed as visible escapes (`\x1b`, `\u{202e}`). `--json` stays raw.
+
+When stdout is closed early (`| head`, `grep -m1`), scli stops quietly with exit code 0.
+
+Slack calls time out after 60s (10s to connect); a timed-out write may or may not have taken effect. File transfers fail when stalled for 60s.
 
 Empty results print nothing on stdout. A `no messages` / `no channels` style note goes to stderr and the exit code stays 0, so `| wc -l` is a true count and `cut -f1` never sees a fake id.
 
@@ -41,7 +53,7 @@ Empty results print nothing on stdout. A `no messages` / `no channels` style not
 |---|---|
 | `0` | success, including empty results |
 | `1` | any error |
-| `3` | Slack rate limit (HTTP 429 or `ratelimited`); stderr names the `Retry-After` when Slack sends one |
+| `3` | Slack rate limit (HTTP 429 or `ratelimited`, including file downloads and uploads); stderr names the `Retry-After` when Slack sends one |
 
 ## JSON output
 

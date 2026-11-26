@@ -139,6 +139,7 @@ enum ReadCmd {
         /// Channel ID (C…/G…/D…) or #name / @user.
         channel: String,
         /// Message text, or omit / "-" to read from stdin.
+        #[arg(allow_hyphen_values = true)]
         text: Option<String>,
         /// Reply in this thread (parent message ts).
         #[arg(long)]
@@ -150,10 +151,15 @@ enum ReadCmd {
 #[derive(Subcommand)]
 enum WriteCmd {
     /// Send a message; optionally in a thread and/or with file attachments.
+    ///
+    /// `&`, `<` and `>` are escaped so the text shows as written; well-formed
+    /// `<@U…>`, `<#C…>` and `<https://…|label>` stay live. `<!here>`, `<!channel>`,
+    /// `<!everyone>` and `<!subteam^…>` are shown literally unless --allow-broadcast.
     Send {
         /// Channel ID (C…/G…/D…) or #name / @user.
         channel: String,
         /// Message text, or omit / "-" to read from stdin.
+        #[arg(allow_hyphen_values = true)]
         text: Option<String>,
         /// Reply in this thread (parent message ts).
         #[arg(long)]
@@ -161,6 +167,12 @@ enum WriteCmd {
         /// Attach a file (repeatable).
         #[arg(short, long)]
         file: Vec<PathBuf>,
+        /// Send the text verbatim as Slack markup (no escaping at all).
+        #[arg(long)]
+        raw: bool,
+        /// Keep <!here>/<!channel>/<!everyone>/<!subteam^…> as real broadcast mentions.
+        #[arg(long)]
+        allow_broadcast: bool,
     },
 
     /// Add a reaction to a message.
@@ -224,6 +236,7 @@ enum Remind {
     /// Create a reminder: scli write remind add "text" --at "in 30 minutes"
     Add {
         /// Reminder text.
+        #[arg(allow_hyphen_values = true)]
         text: String,
         /// When, in Slack's natural language or a unix ts, e.g. 'in 30 minutes'.
         #[arg(long)]
@@ -277,6 +290,55 @@ fn history_limit(s: &str) -> Result<u32, String> {
     Ok(n.min(HISTORY_LIMIT_MAX))
 }
 
+/// Print one text-mode line: server-sourced text is made terminal-safe.
+macro_rules! out {
+    ($($arg:tt)*) => {
+        write_stdout(&sanitize_display(&format!($($arg)*)))
+    };
+}
+
+/// Write a line to stdout; a closed pipe (`| head`) ends the process quietly
+/// with status 0 instead of a panic.
+fn write_stdout(line: &str) {
+    use std::io::Write as _;
+    let mut out = std::io::stdout().lock();
+    if let Err(e) = writeln!(out, "{line}") {
+        if e.kind() == std::io::ErrorKind::BrokenPipe {
+            std::process::exit(0);
+        }
+        panic!("failed printing to stdout: {e}");
+    }
+}
+
+fn display_unsafe(c: char) -> bool {
+    (c.is_control() && c != '\n' && c != '\t')
+        || matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+}
+
+/// Make server-sourced text safe for a terminal: control characters (except
+/// newline and tab) and bidi overrides become visible `\x..`/`\u{..}` escapes;
+/// a CR that ends a CRLF line is dropped.
+fn sanitize_display(s: &str) -> std::borrow::Cow<'_, str> {
+    if !s.chars().any(display_unsafe) {
+        return s.into();
+    }
+    let mut out = String::with_capacity(s.len() + 8);
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\r' && chars.peek() == Some(&'\n') {
+            continue;
+        }
+        if !display_unsafe(c) {
+            out.push(c);
+        } else if (c as u32) < 0x100 {
+            out.push_str(&format!("\\x{:02x}", c as u32));
+        } else {
+            out.push_str(&format!("\\u{{{:x}}}", c as u32));
+        }
+    }
+    out.into()
+}
+
 const SEARCH_PAGE_MAX: u32 = 100;
 const SEARCH_LIMIT_MAX: u32 = 1000;
 
@@ -295,7 +357,8 @@ fn main() {
         let red = anstyle::Style::new()
             .fg_color(Some(anstyle::AnsiColor::Red.into()))
             .bold();
-        anstream::eprintln!("{red}error:{red:#} {e:#}");
+        let msg = sanitize_display(&format!("{e:#}")).into_owned();
+        anstream::eprintln!("{red}error:{red:#} {msg}");
         std::process::exit(exit_code(&e));
     }
 }
@@ -312,7 +375,9 @@ fn run() -> Result<()> {
     if let Cmd::Completions { shell } = cli.cmd {
         let mut cmd = Cli::command();
         let name = cmd.get_name().to_string();
-        clap_complete::generate(shell, &mut cmd, name, &mut std::io::stdout());
+        let mut buf = Vec::new();
+        clap_complete::generate(shell, &mut cmd, name, &mut buf);
+        write_stdout(String::from_utf8_lossy(&buf).trim_end_matches('\n'));
         return Ok(());
     }
 
@@ -352,7 +417,7 @@ fn run() -> Result<()> {
             if let Some(t) = thread {
                 p["thread_ts"] = Value::String(t.clone());
             }
-            println!("{p}");
+            write_stdout(&p.to_string());
             return Ok(());
         }
         _ => {}
@@ -384,7 +449,24 @@ fn run() -> Result<()> {
                 text,
                 thread,
                 file,
-            } => c.send(&channel, read_text(text)?, thread, &file),
+                raw,
+                allow_broadcast,
+            } => {
+                let text = read_text(text)?;
+                let text = if raw {
+                    text
+                } else {
+                    let (escaped, neutralized) = escape_mrkdwn(&text, allow_broadcast);
+                    if !neutralized.is_empty() {
+                        eprintln!(
+                            "note: sent {} as plain text (no notification); pass --allow-broadcast to ping",
+                            neutralized.join(" ")
+                        );
+                    }
+                    escaped
+                };
+                c.send(&channel, text, thread, &file)
+            }
             WriteCmd::React { channel, ts, emoji } => c.react(&channel, &ts, &emoji),
             WriteCmd::Delete { channel, ts } => c.delete(&channel, &ts),
             WriteCmd::Remind(Remind::List) => c.remind_list(),
@@ -459,6 +541,36 @@ struct Client {
     workspace: String,
     /// Read commands print raw Slack records as NDJSON instead of text.
     json: bool,
+    /// `SCLI_API_URL`, when set.
+    api_override: Option<String>,
+    /// Base dir for the id<->name cache; `None` disables caching.
+    cache_dir: Option<PathBuf>,
+    api: ureq::Agent,
+    api_timeout: std::time::Duration,
+    files: ureq::Agent,
+}
+
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const API_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+const TRANSFER_STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Agent for Web API calls: bounded connect and total time.
+fn api_agent(timeout: std::time::Duration) -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout_connect(CONNECT_TIMEOUT)
+        .timeout(timeout)
+        .build()
+}
+
+/// Agent for file transfers: no total limit, but a stalled read or write fails;
+/// credentials are never carried across redirects.
+fn file_agent(stall: std::time::Duration) -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout_connect(CONNECT_TIMEOUT)
+        .timeout_read(stall)
+        .timeout_write(stall)
+        .redirect_auth_headers(ureq::RedirectAuthHeaders::Never)
+        .build()
 }
 
 impl Client {
@@ -513,25 +625,32 @@ impl Client {
             cookie,
             workspace,
             json: false,
+            api_override: api_override(),
+            cache_dir: cache_base().ok(),
+            api: api_agent(API_TIMEOUT),
+            api_timeout: API_TIMEOUT,
+            files: file_agent(TRANSFER_STALL_TIMEOUT),
         })
     }
 
     /// POST application/x-www-form-urlencoded (the Slack Web API convention).
     fn call(&self, method: &str, params: &[(&str, &str)]) -> Result<Value> {
-        let base = api_base(std::env::var("SCLI_API_URL").ok());
-        let mut req = ureq::post(&format!("{base}/{method}"))
+        let base = api_base(self.api_override.clone());
+        let mut req = self
+            .api
+            .post(&format!("{base}/{method}"))
             .set("Authorization", &format!("Bearer {}", self.token));
         if let Some(c) = &self.cookie {
             req = req.set("Cookie", &format!("d={c}"));
         }
-        read(req.send_form(params), method)
+        read(req.send_form(params), method, self.api_timeout)
     }
 
     /// GET a file URL; the token and session cookie go only to Slack-owned hosts.
     fn get_bytes(&self, url: &str) -> Result<Vec<u8>> {
-        let auth = file_auth_allowed(url, api_override().as_deref())
+        let auth = file_auth_allowed(url, self.api_override.as_deref())
             .then_some((self.token.as_str(), self.cookie.as_deref()));
-        fetch_file(url, auth)
+        fetch_file(&self.files, url, auth)
     }
 
     // --- channels / users -------------------------------------------------
@@ -539,7 +658,7 @@ impl Client {
     fn channels(&self, kind: ChannelType, filter: Option<&str>) -> Result<()> {
         let types = kind.api_types();
         let users = if types.contains("im") {
-            self.maps(false)?.users
+            self.maps(&[Dir::Users], false)?.0.users
         } else {
             Vec::new()
         };
@@ -558,14 +677,14 @@ impl Client {
             for ch in v["channels"].as_array().unwrap_or(&vec![]).iter() {
                 let id = ch["id"].as_str().unwrap_or("");
                 let name = match ch["name"].as_str() {
-                    Some(n) => n.to_string(),
+                    Some(n) => flatten(n),
                     None => dm_label(ch["user"].as_str().unwrap_or("?"), &users),
                 };
                 if filter.map(|q| contains_ci(&name, q)).unwrap_or(true) {
                     if self.json {
                         emit_json(ch)?;
                     } else {
-                        println!("{id}\t{name}");
+                        out!("{id}\t{name}");
                     }
                     n += 1;
                 }
@@ -591,16 +710,16 @@ impl Client {
                     continue;
                 }
                 let id = u["id"].as_str().unwrap_or("");
-                let name = u["name"].as_str().unwrap_or("");
-                let real = u["profile"]["real_name"].as_str().unwrap_or("");
+                let name = flatten(u["name"].as_str().unwrap_or(""));
+                let real = flatten(u["profile"]["real_name"].as_str().unwrap_or(""));
                 if filter
-                    .map(|q| contains_ci(name, q) || contains_ci(real, q))
+                    .map(|q| contains_ci(&name, q) || contains_ci(&real, q))
                     .unwrap_or(true)
                 {
                     if self.json {
                         emit_json(u)?;
                     } else {
-                        println!("{id}\t{name}\t{real}");
+                        out!("{id}\t{name}\t{real}");
                     }
                     n += 1;
                 }
@@ -619,14 +738,14 @@ impl Client {
     // --- reading ----------------------------------------------------------
 
     fn read(&self, channel: &str, limit: u32) -> Result<()> {
-        let id = self.resolve_channel(channel)?;
+        let id = self.resolve_channel(channel, false)?;
         let msgs =
             self.paged_messages("conversations.history", &[("channel", &id)], Some(limit))?;
         self.print_messages(&msgs)
     }
 
     fn thread(&self, channel: &str, ts: &str) -> Result<()> {
-        let id = self.resolve_channel(channel)?;
+        let id = self.resolve_channel(channel, false)?;
         let msgs = self.paged_messages(
             "conversations.replies",
             &[("channel", &id), ("ts", ts)],
@@ -663,11 +782,7 @@ impl Client {
 
     fn dm(&self, user: &str, limit: u32) -> Result<()> {
         let uid = self.resolve_user(user)?;
-        let opened = self.call("conversations.open", &[("users", &uid)])?;
-        let id = opened["channel"]["id"]
-            .as_str()
-            .ok_or_else(|| anyhow!("could not open DM"))?
-            .to_string();
+        let id = self.existing_dm(&uid, user)?;
         self.read(&id, limit)
     }
 
@@ -681,7 +796,7 @@ impl Client {
             return Ok(());
         }
         for m in &msgs {
-            println!("{}", message_line(m));
+            out!("{}", message_line(m));
         }
         Ok(())
     }
@@ -712,11 +827,11 @@ impl Client {
             }
             for m in &matches {
                 let chan_id = m["channel"]["id"].as_str().unwrap_or("");
-                let chan = m["channel"]["name"].as_str().unwrap_or("");
+                let chan = flatten(m["channel"]["name"].as_str().unwrap_or(""));
                 let ts = m["ts"].as_str().unwrap_or("");
-                let user = m["username"].as_str().or(m["user"].as_str()).unwrap_or("?");
-                let text = m["text"].as_str().unwrap_or("").replace('\n', " ");
-                println!("{chan_id}\t{chan}\t{ts}\t{user}\t{text}");
+                let user = flatten(m["username"].as_str().or(m["user"].as_str()).unwrap_or("?"));
+                let text = flatten(m["text"].as_str().unwrap_or(""));
+                out!("{chan_id}\t{chan}\t{ts}\t{user}\t{text}");
             }
         }
         if let Some(hint) = search_hint(matches.len(), total, limit) {
@@ -727,13 +842,33 @@ impl Client {
 
     // --- files ------------------------------------------------------------
 
-    fn files(&self, channel: &str, ts: &str, download: Option<PathBuf>) -> Result<()> {
-        let id = self.resolve_channel(channel)?;
+    /// The message with exactly this ts: a top-level message via history, else
+    /// a thread reply found by paging the thread.
+    fn message(&self, channel: &str, ts: &str) -> Result<Value> {
         let v = self.call(
-            "conversations.replies",
-            &[("channel", &id), ("ts", ts), ("limit", "1")],
+            "conversations.history",
+            &[
+                ("channel", channel),
+                ("latest", ts),
+                ("oldest", ts),
+                ("inclusive", "true"),
+                ("limit", "1"),
+            ],
         )?;
-        let msg = message_with_ts(&v, ts).ok_or_else(|| anyhow!("message not found"))?;
+        if let Some(m) = message_with_ts(&v, ts) {
+            return Ok(m);
+        }
+        let thread = self.paged_messages(
+            "conversations.replies",
+            &[("channel", channel), ("ts", ts)],
+            None,
+        )?;
+        find_ts(&thread, ts).ok_or_else(|| anyhow!("message {ts} not found"))
+    }
+
+    fn files(&self, channel: &str, ts: &str, download: Option<PathBuf>) -> Result<()> {
+        let id = self.resolve_channel(channel, false)?;
+        let msg = self.message(&id, ts)?;
         let files = msg["files"].as_array().cloned().unwrap_or_default();
         let attachments = msg["attachments"].as_array().cloned().unwrap_or_default();
         if self.json {
@@ -749,14 +884,15 @@ impl Client {
         // attachments array, not files. Downloading applies to uploaded files only.
         if !self.json {
             for a in &attachments {
-                println!("attachment\t{}", attachment_text(a));
+                out!("attachment\t{}", attachment_text(a));
             }
         }
         if let Some(dir) = &download {
             std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
         }
         for f in &files {
-            let name = f["name"].as_str().unwrap_or("file");
+            let raw_name = f["name"].as_str().unwrap_or("file");
+            let name = &flatten(raw_name);
             let fid = f["id"].as_str().unwrap_or("");
             let url = f["url_private_download"]
                 .as_str()
@@ -764,15 +900,15 @@ impl Client {
                 .unwrap_or("");
             match &download {
                 None if self.json => {}
-                None => println!("{name}\t{url}"),
+                None => out!("{name}\t{url}"),
                 Some(dir) => match download_url(f, api_override().as_deref()) {
                     Err(reason) => {
                         if self.json {
                             emit_json(&serde_json::json!({
-                                "skipped": name, "id": fid, "reason": reason
+                                "skipped": raw_name, "id": fid, "reason": reason
                             }))?;
                         } else {
-                            println!("skipped {name}\t({reason})");
+                            out!("skipped {name}\t({reason})");
                         }
                     }
                     Ok(url) => {
@@ -783,7 +919,7 @@ impl Client {
                                 "saved": path.display().to_string(), "id": fid
                             }))?;
                         } else {
-                            println!("saved {}", path.display());
+                            out!("saved {}", path.display());
                         }
                     }
                 },
@@ -801,21 +937,21 @@ impl Client {
         thread: Option<String>,
         files: &[PathBuf],
     ) -> Result<()> {
-        let id = self.resolve_channel(channel)?;
+        let id = self.resolve_channel(channel, true)?;
         if files.is_empty() {
             let mut params = vec![("channel", id.as_str()), ("text", text.as_str())];
             if let Some(t) = &thread {
                 params.push(("thread_ts", t));
             }
             let v = self.call("chat.postMessage", &params)?;
-            println!("{}", v["ts"].as_str().unwrap_or("ok"));
+            out!("{}", v["ts"].as_str().unwrap_or("ok"));
         } else {
             let mut ids = Vec::with_capacity(files.len());
             for f in files {
                 ids.push(self.upload_file(f)?);
             }
             let v = self.complete_upload(&id, &ids, &text, thread.as_deref())?;
-            println!("{}", shared_ts(&v).unwrap_or_else(|| ids.join(",")));
+            out!("{}", shared_ts(&v).unwrap_or_else(|| ids.join(",")));
         }
         Ok(())
     }
@@ -842,9 +978,10 @@ impl Client {
             .ok_or_else(|| anyhow!("no file_id returned"))?
             .to_string();
 
-        ureq::post(upload_url)
+        self.files
+            .post(upload_url)
             .send_bytes(&bytes)
-            .with_context(|| "uploading file bytes")?;
+            .map_err(|e| transfer_error("uploading file bytes", e))?;
         Ok(file_id)
     }
 
@@ -869,20 +1006,20 @@ impl Client {
     }
 
     fn react(&self, channel: &str, ts: &str, emoji: &str) -> Result<()> {
-        let id = self.resolve_channel(channel)?;
+        let id = self.resolve_channel(channel, true)?;
         let name = emoji.trim_matches(':');
         self.call(
             "reactions.add",
             &[("channel", &id), ("timestamp", ts), ("name", name)],
         )?;
-        println!("ok");
+        out!("ok");
         Ok(())
     }
 
     fn delete(&self, channel: &str, ts: &str) -> Result<()> {
-        let id = self.resolve_channel(channel)?;
+        let id = self.resolve_channel(channel, true)?;
         self.call("chat.delete", &[("channel", &id), ("ts", ts)])?;
-        println!("deleted\t{id}\t{ts}");
+        out!("deleted\t{id}\t{ts}");
         Ok(())
     }
 
@@ -899,8 +1036,8 @@ impl Client {
         for r in &rs {
             let id = r["id"].as_str().unwrap_or("");
             let time = r["time"].as_i64().unwrap_or(0);
-            let text = r["text"].as_str().unwrap_or("");
-            println!("{id}\t{time}\t{text}");
+            let text = flatten(r["text"].as_str().unwrap_or(""));
+            out!("{id}\t{time}\t{text}");
         }
         Ok(())
     }
@@ -908,89 +1045,131 @@ impl Client {
     fn remind_add(&self, text: &str, at: &str) -> Result<()> {
         eprintln!("warning: Slack reminders.* is deprecated and may stop working");
         let v = self.call("reminders.add", &[("text", text), ("time", at)])?;
-        println!("{}", v["reminder"]["id"].as_str().unwrap_or("ok"));
+        out!("{}", v["reminder"]["id"].as_str().unwrap_or("ok"));
         Ok(())
     }
 
     // --- cache ------------------------------------------------------------
 
-    /// id<->name maps for this workspace: fresh cache when available, otherwise
-    /// refetch from the API and rewrite. `force` always refetches.
-    fn maps(&self, force: bool) -> Result<Maps> {
-        if !force {
-            if let Some(m) = load_maps(&self.workspace).filter(Maps::is_fresh) {
-                return Ok(m);
+    /// The cached directories, refetching each of `dirs` that is stale (or all
+    /// of them with `force`). Returns the maps and whether anything was fetched.
+    fn maps(&self, dirs: &[Dir], force: bool) -> Result<(Maps, bool)> {
+        let mut m = self.load_maps().unwrap_or_default();
+        let mut fetched = false;
+        for &d in dirs {
+            if force || !m.is_fresh(d, now_secs()) {
+                self.fetch_dir(&mut m, d)?;
+                fetched = true;
             }
         }
-        let m = self.fetch_maps()?;
-        save_maps(&self.workspace, &m).ok();
-        Ok(m)
+        if fetched {
+            self.save_maps(&m).ok();
+        }
+        Ok((m, fetched))
     }
 
-    /// Page channels (public+private) and users into a fresh `Maps`.
-    fn fetch_maps(&self) -> Result<Maps> {
-        let mut channels = Vec::new();
+    /// Look something up in one cached directory, refetching only that
+    /// directory, and only when the cached copy misses.
+    fn lookup<T>(&self, d: Dir, find: impl Fn(&Maps) -> Result<Option<T>>) -> Result<Option<T>> {
+        let (m, fetched) = self.maps(&[d], false)?;
+        if let Some(hit) = find(&m)? {
+            return Ok(Some(hit));
+        }
+        if fetched {
+            return Ok(None);
+        }
+        find(&self.maps(&[d], true)?.0)
+    }
+
+    /// Every item of a cursor-paginated list method.
+    fn list_all(&self, method: &str, params: &[(&str, &str)], key: &str) -> Result<Vec<Value>> {
+        let mut items = Vec::new();
         let mut cursor = String::new();
         loop {
-            let v = self.call(
-                "conversations.list",
-                &[
-                    ("types", "public_channel,private_channel"),
-                    ("limit", "200"),
-                    ("exclude_archived", "true"),
-                    ("cursor", &cursor),
-                ],
-            )?;
-            for ch in v["channels"].as_array().unwrap_or(&vec![]).iter() {
-                if let (Some(id), Some(name)) = (ch["id"].as_str(), ch["name"].as_str()) {
-                    channels.push(Chan {
-                        id: id.to_string(),
-                        name: name.to_string(),
-                    });
-                }
-            }
+            let mut p = params.to_vec();
+            p.push(("cursor", &cursor));
+            let v = self.call(method, &p)?;
+            items.extend(v[key].as_array().cloned().unwrap_or_default());
             cursor = next_cursor(&v);
             if cursor.is_empty() {
-                break;
+                return Ok(items);
             }
         }
+    }
 
-        let mut users = Vec::new();
-        let mut cursor = String::new();
-        loop {
-            let v = self.call("users.list", &[("limit", "200"), ("cursor", &cursor)])?;
-            for u in v["members"].as_array().unwrap_or(&vec![]).iter() {
-                if u["deleted"].as_bool().unwrap_or(false) {
-                    continue;
-                }
-                let Some(id) = u["id"].as_str() else { continue };
-                users.push(Usr {
-                    id: id.to_string(),
-                    name: u["name"].as_str().unwrap_or("").to_string(),
-                    real: u["profile"]["real_name"].as_str().unwrap_or("").to_string(),
-                    display: u["profile"]["display_name"]
-                        .as_str()
-                        .unwrap_or("")
-                        .to_string(),
-                });
+    fn fetch_dir(&self, m: &mut Maps, d: Dir) -> Result<()> {
+        let s = |v: &Value| v.as_str().unwrap_or("").to_string();
+        match d {
+            Dir::Channels => {
+                let list = self.list_all(
+                    "conversations.list",
+                    &[
+                        ("types", "public_channel,private_channel"),
+                        ("limit", "1000"),
+                        ("exclude_archived", "true"),
+                    ],
+                    "channels",
+                )?;
+                m.channels = list
+                    .iter()
+                    .filter(|c| c["id"].is_string() && c["name"].is_string())
+                    .map(|c| Chan {
+                        id: s(&c["id"]),
+                        name: s(&c["name"]),
+                    })
+                    .collect();
             }
-            cursor = next_cursor(&v);
-            if cursor.is_empty() {
-                break;
+            Dir::Users => {
+                let list = self.list_all("users.list", &[("limit", "200")], "members")?;
+                m.users = list
+                    .iter()
+                    .filter(|u| !u["deleted"].as_bool().unwrap_or(false) && u["id"].is_string())
+                    .map(|u| Usr {
+                        id: s(&u["id"]),
+                        name: s(&u["name"]),
+                        real: s(&u["profile"]["real_name"]),
+                        display: s(&u["profile"]["display_name"]),
+                    })
+                    .collect();
+            }
+            Dir::Ims => {
+                let list = self.list_all(
+                    "conversations.list",
+                    &[("types", "im"), ("limit", "1000")],
+                    "channels",
+                )?;
+                m.ims = list
+                    .iter()
+                    .filter(|c| c["id"].is_string() && c["user"].is_string())
+                    .map(|c| Im {
+                        id: s(&c["id"]),
+                        user: s(&c["user"]),
+                    })
+                    .collect();
             }
         }
+        m.stamps[d as usize] = now_secs();
+        Ok(())
+    }
 
-        Ok(Maps {
-            fetched: now_secs(),
-            channels,
-            users,
-        })
+    fn load_maps(&self) -> Option<Maps> {
+        let path = cache_path(self.cache_dir.as_ref()?, &self.workspace);
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
+        Some(Maps::from_json(&v))
+    }
+
+    fn save_maps(&self, m: &Maps) -> Result<()> {
+        let dir = self.cache_dir.as_ref().context("no cache dir")?;
+        write_private(
+            &cache_path(dir, &self.workspace),
+            serde_json::to_string(&m.to_json())?.as_bytes(),
+        )
     }
 
     /// `scli write sync` — force-refresh the cache now.
     fn sync(&self) -> Result<()> {
-        let m = self.maps(true)?;
-        println!(
+        let (m, _) = self.maps(&[Dir::Channels, Dir::Users], true)?;
+        out!(
             "synced {}: {} channels, {} users",
             self.workspace,
             m.channels.len(),
@@ -1001,14 +1180,14 @@ impl Client {
 
     /// `scli read ls <substr>` — substring search across cached channels AND users.
     fn ls(&self, query: &str) -> Result<()> {
-        let m = self.maps(false)?;
+        let (m, _) = self.maps(&[Dir::Channels, Dir::Users], false)?;
         let mut n = 0;
         for c in &m.channels {
             if contains_ci(&c.name, query) {
                 if self.json {
                     emit_json(&serde_json::json!({"kind": "chan", "id": c.id, "name": c.name}))?;
                 } else {
-                    println!("chan\t{}\t{}", c.id, c.name);
+                    out!("chan\t{}\t{}", c.id, c.name);
                 }
                 n += 1;
             }
@@ -1021,7 +1200,7 @@ impl Client {
                 if self.json {
                     emit_json(&serde_json::json!({"kind": "user", "id": u.id, "name": u.name}))?;
                 } else {
-                    println!("user\t{}\t{}", u.id, u.name);
+                    out!("user\t{}\t{}", u.id, u.name);
                 }
                 n += 1;
             }
@@ -1034,10 +1213,15 @@ impl Client {
 
     // --- resolution helpers ----------------------------------------------
 
-    /// Accept a raw ID, a #name, or a @user (resolved to a DM channel).
-    fn resolve_channel(&self, s: &str) -> Result<String> {
+    /// Accept a raw ID, a #name, or a @user (resolved to a DM channel). Only
+    /// `open_dm` (the write tier) may call conversations.open; reads use an
+    /// existing DM.
+    fn resolve_channel(&self, s: &str, open_dm: bool) -> Result<String> {
         if let Some(name) = s.strip_prefix('@') {
             let uid = self.resolve_user(name)?;
+            if !open_dm {
+                return self.existing_dm(&uid, s);
+            }
             let v = self.call("conversations.open", &[("users", &uid)])?;
             return v["channel"]["id"]
                 .as_str()
@@ -1048,13 +1232,17 @@ impl Client {
         if is_channel_id(name) {
             return Ok(name.to_string());
         }
-        // Cache-first: try fresh cache, and on a miss refetch once before failing.
-        for force in [false, true] {
-            if let Some(id) = self.maps(force)?.find_channel(name)? {
-                return Ok(id);
-            }
-        }
-        bail!("channel '{s}' not found")
+        self.lookup(Dir::Channels, |m| m.find_channel(name))?
+            .ok_or_else(|| anyhow!("channel '{s}' not found"))
+    }
+
+    /// The id of the existing DM with `uid`, without creating one.
+    fn existing_dm(&self, uid: &str, label: &str) -> Result<String> {
+        let label = label.strip_prefix('@').unwrap_or(label);
+        self.lookup(Dir::Ims, |m| {
+            Ok(m.ims.iter().find(|i| i.user == uid).map(|i| i.id.clone()))
+        })?
+        .ok_or_else(|| anyhow!("no DM with @{label} (read commands never open one)"))
     }
 
     fn resolve_user(&self, s: &str) -> Result<String> {
@@ -1062,12 +1250,8 @@ impl Client {
         if is_user_id(name) {
             return Ok(name.to_string());
         }
-        for force in [false, true] {
-            if let Some(id) = self.maps(force)?.find_user(name)? {
-                return Ok(id);
-            }
-        }
-        bail!("user '{s}' not found")
+        self.lookup(Dir::Users, |m| m.find_user(name))?
+            .ok_or_else(|| anyhow!("user '{s}' not found"))
     }
 }
 
@@ -1075,7 +1259,26 @@ impl Client {
 // Local id<->name cache: ~/.cache/scli/<workspace>.json (respects XDG_CACHE_HOME).
 // ---------------------------------------------------------------------------
 
-const CACHE_TTL_SECS: u64 = 300;
+/// How long a cached directory is trusted; a lookup miss always refetches.
+const CACHE_TTL_SECS: u64 = 3600;
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Dir {
+    Channels = 0,
+    Users = 1,
+    Ims = 2,
+}
+
+const DIRS: [(Dir, &str); 3] = [
+    (Dir::Channels, "channels"),
+    (Dir::Users, "users"),
+    (Dir::Ims, "ims"),
+];
+
+struct Im {
+    id: String,
+    user: String,
+}
 
 struct Chan {
     id: String,
@@ -1089,15 +1292,19 @@ struct Usr {
     display: String,
 }
 
+/// The cached directories, each with its own fetch time (0 = never fetched).
+#[derive(Default)]
 struct Maps {
-    fetched: u64,
+    stamps: [u64; 3],
     channels: Vec<Chan>,
     users: Vec<Usr>,
+    ims: Vec<Im>,
 }
 
 impl Maps {
-    fn is_fresh(&self) -> bool {
-        now_secs().saturating_sub(self.fetched) < CACHE_TTL_SECS
+    fn is_fresh(&self, d: Dir, now: u64) -> bool {
+        let t = self.stamps[d as usize];
+        t > 0 && now.saturating_sub(t) < CACHE_TTL_SECS
     }
 
     /// Case-insensitive name lookup; an exact-case hit wins when several match,
@@ -1149,44 +1356,78 @@ impl Maps {
     }
 
     fn to_json(&self) -> Value {
-        serde_json::json!({
-            "fetched": self.fetched,
-            "channels": self.channels.iter()
-                .map(|c| serde_json::json!({ "id": c.id, "name": c.name }))
-                .collect::<Vec<_>>(),
-            "users": self.users.iter()
-                .map(|u| serde_json::json!({
-                    "id": u.id, "name": u.name, "real": u.real, "display": u.display
-                }))
-                .collect::<Vec<_>>(),
-        })
+        let items = |d: Dir| -> Vec<Value> {
+            match d {
+                Dir::Channels => self
+                    .channels
+                    .iter()
+                    .map(|c| serde_json::json!({ "id": c.id, "name": c.name }))
+                    .collect(),
+                Dir::Users => self
+                    .users
+                    .iter()
+                    .map(|u| {
+                        serde_json::json!({
+                            "id": u.id, "name": u.name, "real": u.real, "display": u.display
+                        })
+                    })
+                    .collect(),
+                Dir::Ims => self
+                    .ims
+                    .iter()
+                    .map(|i| serde_json::json!({ "id": i.id, "user": i.user }))
+                    .collect(),
+            }
+        };
+        let mut v = serde_json::json!({});
+        for (d, key) in DIRS {
+            v[key] = serde_json::json!({ "fetched": self.stamps[d as usize], "items": items(d) });
+        }
+        v
     }
 
+    /// Reads the per-directory layout, and the older single-`fetched` one.
     fn from_json(v: &Value) -> Maps {
         let s = |x: &Value, k: &str| x[k].as_str().unwrap_or("").to_string();
-        Maps {
-            fetched: v["fetched"].as_u64().unwrap_or(0),
-            channels: v["channels"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .map(|c| Chan {
-                    id: s(c, "id"),
-                    name: s(c, "name"),
-                })
-                .collect(),
-            users: v["users"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .map(|u| Usr {
-                    id: s(u, "id"),
-                    name: s(u, "name"),
-                    real: s(u, "real"),
-                    display: s(u, "display"),
-                })
-                .collect(),
+        let mut m = Maps::default();
+        for (d, key) in DIRS {
+            let (stamp, items) = if v[key].is_array() {
+                (v["fetched"].as_u64().unwrap_or(0), &v[key])
+            } else {
+                (v[key]["fetched"].as_u64().unwrap_or(0), &v[key]["items"])
+            };
+            let items = items.as_array().into_iter().flatten();
+            m.stamps[d as usize] = stamp;
+            match d {
+                Dir::Channels => {
+                    m.channels = items
+                        .map(|c| Chan {
+                            id: s(c, "id"),
+                            name: s(c, "name"),
+                        })
+                        .collect()
+                }
+                Dir::Users => {
+                    m.users = items
+                        .map(|u| Usr {
+                            id: s(u, "id"),
+                            name: s(u, "name"),
+                            real: s(u, "real"),
+                            display: s(u, "display"),
+                        })
+                        .collect()
+                }
+                Dir::Ims => {
+                    m.ims = items
+                        .map(|i| Im {
+                            id: s(i, "id"),
+                            user: s(i, "user"),
+                        })
+                        .collect()
+                }
+            }
         }
+        m
     }
 }
 
@@ -1209,26 +1450,15 @@ fn short_hash(input: &str) -> String {
         .collect()
 }
 
-fn cache_path(workspace: &str) -> Result<PathBuf> {
-    let base = std::env::var("XDG_CACHE_HOME")
+fn cache_base() -> Result<PathBuf> {
+    std::env::var("XDG_CACHE_HOME")
         .map(PathBuf::from)
         .or_else(|_| std::env::var("HOME").map(|h| PathBuf::from(h).join(".cache")))
-        .context("no HOME/XDG_CACHE_HOME")?;
-    Ok(base.join("scli").join(format!("{workspace}.json")))
+        .context("no HOME/XDG_CACHE_HOME")
 }
 
-fn load_maps(workspace: &str) -> Option<Maps> {
-    let path = cache_path(workspace).ok()?;
-    let s = std::fs::read_to_string(path).ok()?;
-    let v: Value = serde_json::from_str(&s).ok()?;
-    Some(Maps::from_json(&v))
-}
-
-fn save_maps(workspace: &str, m: &Maps) -> Result<()> {
-    let path = cache_path(workspace)?;
-    std::fs::create_dir_all(path.parent().unwrap()).context("creating cache dir")?;
-    std::fs::write(&path, serde_json::to_string(&m.to_json())?).context("writing cache")?;
-    Ok(())
+fn cache_path(base: &std::path::Path, workspace: &str) -> PathBuf {
+    base.join("scli").join(format!("{workspace}.json"))
 }
 
 /// `ID (name), ID (name)` for an ambiguity error.
@@ -1263,7 +1493,7 @@ fn is_user_id(s: &str) -> bool {
 }
 
 fn emit_json(v: &Value) -> Result<()> {
-    println!("{}", serde_json::to_string(v)?);
+    write_stdout(&serde_json::to_string(v)?);
     Ok(())
 }
 
@@ -1355,13 +1585,13 @@ fn search_hint(shown: usize, total: i64, limit: u32) -> Option<String> {
     Some(format!("showing {shown} of {total} matches ({advice})"))
 }
 
-/// The message whose ts was asked for; the first one if Slack returned no exact match.
+/// The message in a response whose ts is exactly `ts`.
 fn message_with_ts(v: &Value, ts: &str) -> Option<Value> {
-    let msgs = v["messages"].as_array()?;
-    msgs.iter()
-        .find(|m| m["ts"].as_str() == Some(ts))
-        .or_else(|| msgs.first())
-        .cloned()
+    find_ts(v["messages"].as_array()?, ts)
+}
+
+fn find_ts(msgs: &[Value], ts: &str) -> Option<Value> {
+    msgs.iter().find(|m| m["ts"].as_str() == Some(ts)).cloned()
 }
 
 /// Messages oldest-first: history is newest-first, replies oldest-first.
@@ -1386,7 +1616,7 @@ fn message_line(m: &Value) -> String {
 /// One-line rendering of a message body: `text` (falling back to blocks, or
 /// appending them when they differ) plus thread/reaction/file/attachment tags.
 fn message_text(m: &Value) -> String {
-    let mut text = m["text"].as_str().unwrap_or("").replace('\n', " ");
+    let mut text = flatten(m["text"].as_str().unwrap_or(""));
     let blocks = blocks_text(m);
     if text.is_empty() {
         text = blocks;
@@ -1433,13 +1663,15 @@ fn reactions_str(m: &Value) -> String {
 /// Compact one-line rendering of a link/rich attachment:
 /// pretext | title<TAB>link | text | field: value ...
 fn attachment_text(a: &Value) -> String {
-    let title = a["title"].as_str().unwrap_or("");
-    let link = a["title_link"]
-        .as_str()
-        .or(a["from_url"].as_str())
-        .unwrap_or("");
-    let pretext = a["pretext"].as_str().unwrap_or("").replace('\n', " ");
-    let text = a["text"].as_str().unwrap_or("").replace('\n', " ");
+    let title = flatten(a["title"].as_str().unwrap_or(""));
+    let link = flatten(
+        a["title_link"]
+            .as_str()
+            .or(a["from_url"].as_str())
+            .unwrap_or(""),
+    );
+    let pretext = flatten(a["pretext"].as_str().unwrap_or(""));
+    let text = flatten(a["text"].as_str().unwrap_or(""));
     let mut parts: Vec<String> = Vec::new();
     if !pretext.is_empty() {
         parts.push(pretext);
@@ -1451,8 +1683,8 @@ fn attachment_text(a: &Value) -> String {
         parts.push(text);
     }
     for f in a["fields"].as_array().into_iter().flatten() {
-        let t = f["title"].as_str().unwrap_or("");
-        let val = f["value"].as_str().unwrap_or("").replace('\n', " ");
+        let t = flatten(f["title"].as_str().unwrap_or(""));
+        let val = flatten(f["value"].as_str().unwrap_or(""));
         parts.push(format!("{t}: {val}").trim().to_string());
     }
     let blocks = blocks_text(a);
@@ -1460,7 +1692,7 @@ fn attachment_text(a: &Value) -> String {
         parts.push(blocks);
     }
     if parts.is_empty() {
-        let fallback = a["fallback"].as_str().unwrap_or("").replace('\n', " ");
+        let fallback = flatten(a["fallback"].as_str().unwrap_or(""));
         if !fallback.is_empty() {
             parts.push(fallback);
         }
@@ -1468,12 +1700,99 @@ fn attachment_text(a: &Value) -> String {
     parts.join(" | ")
 }
 
+enum Markup {
+    Keep,
+    Broadcast,
+    Text,
+}
+
+/// What a `<…>` sequence (without the brackets) means to Slack.
+fn classify_markup(inner: &str) -> Markup {
+    let target = inner.split('|').next().unwrap_or("");
+    if target.is_empty() || target.chars().any(char::is_whitespace) {
+        return Markup::Text;
+    }
+    if let Some(cmd) = target.strip_prefix('!') {
+        return match cmd {
+            "here" | "channel" | "everyone" => Markup::Broadcast,
+            c if c.starts_with("subteam^") => Markup::Broadcast,
+            c if c.starts_with("date^") => Markup::Keep,
+            _ => Markup::Text,
+        };
+    }
+    let live = target.strip_prefix('@').is_some_and(is_user_id)
+        || target.strip_prefix('#').is_some_and(is_channel_id)
+        || ["https://", "http://", "mailto:"]
+            .iter()
+            .any(|p| target.starts_with(p) && target.len() > p.len());
+    if live {
+        Markup::Keep
+    } else {
+        Markup::Text
+    }
+}
+
+/// Escape `&`, `<` and `>` for Slack's `text`, keeping existing entities and
+/// well-formed mentions/links. Broadcast mentions are escaped (shown literally)
+/// unless `allow_broadcast`; those are returned so the caller can say so.
+fn escape_mrkdwn(text: &str, allow_broadcast: bool) -> (String, Vec<String>) {
+    let mut out = String::with_capacity(text.len());
+    let mut neutralized = Vec::new();
+    let mut rest = text;
+    while let Some(i) = rest.find(['<', '>', '&']) {
+        out.push_str(&rest[..i]);
+        let tail = &rest[i..];
+        if tail.starts_with('&') {
+            let ent = ["&amp;", "&lt;", "&gt;"]
+                .into_iter()
+                .find(|e| tail.starts_with(e));
+            out.push_str(ent.unwrap_or("&amp;"));
+            rest = &tail[ent.map_or(1, str::len)..];
+            continue;
+        }
+        if let Some(after) = tail.strip_prefix('>') {
+            out.push_str("&gt;");
+            rest = after;
+            continue;
+        }
+        if let Some(end) = tail.find('>') {
+            let inner = &tail[1..end];
+            if !inner.contains(['<', '\n']) {
+                let keep = match classify_markup(inner) {
+                    Markup::Keep => true,
+                    Markup::Broadcast if allow_broadcast => true,
+                    Markup::Broadcast => {
+                        neutralized.push(tail[..=end].to_string());
+                        false
+                    }
+                    Markup::Text => false,
+                };
+                if keep {
+                    out.push_str(&tail[..=end]);
+                    rest = &tail[end + 1..];
+                    continue;
+                }
+            }
+        }
+        out.push_str("&lt;");
+        rest = &tail[1..];
+    }
+    out.push_str(rest);
+    (out, neutralized)
+}
+
+/// One-line form of a text field: TAB, CR and LF become spaces so a field never
+/// splits a TAB-separated record.
+fn flatten(s: &str) -> String {
+    s.replace(['\t', '\r', '\n'], " ")
+}
+
 /// Flatten Block Kit `blocks` to one line; parts joined with " | ".
 /// Interactive blocks are skipped (`actions` becomes `[actions:N]`).
 fn blocks_text(m: &Value) -> String {
     let mut parts: Vec<String> = Vec::new();
     let mut push = |s: String| {
-        let s = s.replace('\n', " ").trim().to_string();
+        let s = flatten(&s).trim().to_string();
         if !s.is_empty() {
             parts.push(s);
         }
@@ -1563,26 +1882,52 @@ fn exit_code(e: &anyhow::Error) -> i32 {
     }
 }
 
+/// HTTP 429 as `RateLimited`, carrying Slack's Retry-After. Rate limits are the
+/// caller's problem by design, so nothing here sleeps or retries.
+fn rate_limited(what: &str, r: &ureq::Response) -> anyhow::Error {
+    let wait = r
+        .header("retry-after")
+        .map(|s| format!("{s}s"))
+        .unwrap_or_else(|| "a bit".into());
+    RateLimited(format!(
+        "{what}: rate limited (HTTP 429) — retry after {wait}"
+    ))
+    .into()
+}
+
+fn is_timeout(e: &ureq::Error) -> bool {
+    let mut src = std::error::Error::source(e);
+    while let Some(s) = src {
+        if let Some(io) = s.downcast_ref::<std::io::Error>() {
+            if matches!(
+                io.kind(),
+                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+            ) {
+                return true;
+            }
+        }
+        src = s.source();
+    }
+    false
+}
+
 /// Parse a Slack Web API response: enforce `ok: true`.
-fn read(resp: Result<ureq::Response, ureq::Error>, method: &str) -> Result<Value> {
+fn read(
+    resp: Result<ureq::Response, ureq::Error>,
+    method: &str,
+    timeout: std::time::Duration,
+) -> Result<Value> {
     let body = match resp {
         Ok(r) => r,
-        // Rate limits are the caller's problem by design: no sleeping or retrying
-        // in here — report Slack's Retry-After so an agent knows how long to wait.
-        Err(ureq::Error::Status(429, r)) => {
-            let wait = r
-                .header("retry-after")
-                .map(|s| format!("{s}s"))
-                .unwrap_or_else(|| "a bit".into());
-            return Err(RateLimited(format!(
-                "{method}: rate limited (HTTP 429) — retry after {wait}"
-            ))
-            .into());
-        }
+        Err(ureq::Error::Status(429, r)) => return Err(rate_limited(method, &r)),
         Err(ureq::Error::Status(code, r)) => {
             let txt = r.into_string().unwrap_or_default();
             bail!("{method}: HTTP {code}: {txt}");
         }
+        Err(e) if is_timeout(&e) => bail!(
+            "{method}: timed out after {}s (the request may or may not have taken effect)",
+            timeout.as_secs_f32()
+        ),
         Err(e) => return Err(e).with_context(|| format!("{method} request failed")),
     };
     let v: Value = body
@@ -1694,7 +2039,7 @@ fn auth(name: &str, token: &str, cookie: Option<&str>) -> Result<()> {
         cfg["default"] = Value::String(name.to_string());
     }
     save_config(&cfg)?;
-    println!("saved workspace '{name}'");
+    out!("saved workspace '{name}'");
     Ok(())
 }
 
@@ -1708,7 +2053,7 @@ fn workspaces(json: bool) -> Result<()> {
                     emit_json(&serde_json::json!({"name": name, "default": name == default}))?;
                 } else {
                     let mark = if name == default { " (default)" } else { "" };
-                    println!("{name}{mark}");
+                    out!("{name}{mark}");
                 }
             }
         }
@@ -1725,7 +2070,7 @@ fn set_default(name: &str) -> Result<()> {
     }
     cfg["default"] = Value::String(name.to_string());
     save_config(&cfg)?;
-    println!("default = {name}");
+    out!("default = {name}");
     Ok(())
 }
 
@@ -1819,12 +2164,12 @@ fn self_update(check_only: bool) -> Result<()> {
         .ok_or_else(|| anyhow!("release has no tag_name"))?;
 
     if parse_ver(tag) <= parse_ver(current) {
-        println!("scli is up to date (v{current})");
+        out!("scli is up to date (v{current})");
         return Ok(());
     }
 
     if check_only {
-        println!("{tag} available (you have v{current}) — run 'scli write update'");
+        out!("{tag} available (you have v{current}) — run 'scli write update'");
         return Ok(());
     }
 
@@ -1890,7 +2235,7 @@ fn self_update(check_only: bool) -> Result<()> {
             )
         });
     }
-    println!("updated to {tag}");
+    out!("updated to {tag}");
     Ok(())
 }
 
@@ -2063,10 +2408,11 @@ fn download_url<'a>(
 
 /// GET `url`, sending `auth` (token, optional `d` cookie) on the first request
 /// only; ureq drops both headers on any redirect.
-fn fetch_file(url: &str, auth: Option<(&str, Option<&str>)>) -> Result<Vec<u8>> {
-    let agent = ureq::AgentBuilder::new()
-        .redirect_auth_headers(ureq::RedirectAuthHeaders::Never)
-        .build();
+fn fetch_file(
+    agent: &ureq::Agent,
+    url: &str,
+    auth: Option<(&str, Option<&str>)>,
+) -> Result<Vec<u8>> {
     let mut req = agent.get(url);
     if let Some((token, cookie)) = auth {
         req = req.set("Authorization", &format!("Bearer {token}"));
@@ -2074,12 +2420,23 @@ fn fetch_file(url: &str, auth: Option<(&str, Option<&str>)>) -> Result<Vec<u8>> 
             req = req.set("Cookie", &format!("d={c}"));
         }
     }
-    let resp = req.call().with_context(|| format!("GET {url}"))?;
+    let resp = req
+        .call()
+        .map_err(|e| transfer_error(&format!("GET {url}"), e))?;
     let mut buf = Vec::new();
     resp.into_reader()
         .read_to_end(&mut buf)
         .context("reading file body")?;
     Ok(buf)
+}
+
+/// A file transfer error; HTTP 429 becomes `RateLimited` (exit 3).
+fn transfer_error(what: &str, e: ureq::Error) -> anyhow::Error {
+    match e {
+        ureq::Error::Status(429, r) => rate_limited(what, &r),
+        e if is_timeout(&e) => anyhow!("{what}: timed out (stalled transfer)"),
+        e => anyhow::Error::new(e).context(what.to_string()),
+    }
 }
 
 /// `stem-ID.ext` (or `stem-ID-N.ext` for n > 0), the fallback when `name` is taken.
@@ -2199,7 +2556,8 @@ mod tests {
             display: display.into(),
         };
         let m = Maps {
-            fetched: 0,
+            stamps: [0; 3],
+            ims: vec![],
             channels: vec![
                 Chan {
                     id: "C01ABCDEF".into(),
@@ -2238,7 +2596,8 @@ mod tests {
             display: display.into(),
         };
         let m = Maps {
-            fetched: 0,
+            stamps: [0; 3],
+            ims: vec![],
             channels: vec![],
             users: vec![
                 u("U01ABCDEF", "alex.k", "Alex Kim", "Alex"),
@@ -2374,14 +2733,21 @@ mod tests {
                 let (mut sock, _) = listener.accept().unwrap();
                 let mut reader = std::io::BufReader::new(sock.try_clone().unwrap());
                 let mut head = String::new();
+                let mut len = 0;
                 loop {
                     let mut line = String::new();
                     if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
                         break;
                     }
+                    if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        len = v.trim().parse().unwrap();
+                    }
                     head.push_str(&line);
                 }
-                tx.send(head).unwrap();
+                let mut body = vec![0; len];
+                std::io::Read::read_exact(&mut reader, &mut body).unwrap();
+                tx.send(head + "\r\n" + &String::from_utf8_lossy(&body))
+                    .unwrap();
                 sock.write_all(resp.as_bytes()).unwrap();
             }
         });
@@ -2410,6 +2776,7 @@ mod tests {
         );
         let (base, rx1, h1) = http_server(vec![redirect]);
         let got = fetch_file(
+            &file_agent(TRANSFER_STALL_TIMEOUT),
             &format!("{base}/f"),
             Some(("xoxc-secret", Some("xoxd-secret"))),
         );
@@ -2824,7 +3191,7 @@ mod tests {
     #[test]
     fn maps_json_round_trip() {
         let m = Maps {
-            fetched: 42,
+            stamps: [42, 7, 0],
             channels: vec![Chan {
                 id: "C01ABCDEF".into(),
                 name: "dev".into(),
@@ -2835,9 +3202,13 @@ mod tests {
                 real: "Alice Smith".into(),
                 display: "Alice".into(),
             }],
+            ims: vec![Im {
+                id: "D01ABCDEF".into(),
+                user: "U01ABCDEF".into(),
+            }],
         };
         let back = Maps::from_json(&m.to_json());
-        assert_eq!(back.fetched, 42);
+        assert_eq!(back.stamps, [42, 7, 0]);
         assert_eq!(back.channels.len(), 1);
         assert_eq!(back.channels[0].id, "C01ABCDEF");
         assert_eq!(back.channels[0].name, "dev");
@@ -2846,9 +3217,30 @@ mod tests {
         assert_eq!(back.users[0].name, "alice");
         assert_eq!(back.users[0].real, "Alice Smith");
         assert_eq!(back.users[0].display, "Alice");
+        assert_eq!(back.ims[0].id, "D01ABCDEF");
+        assert_eq!(back.ims[0].user, "U01ABCDEF");
         let empty = Maps::from_json(&json!({}));
-        assert_eq!(empty.fetched, 0);
-        assert!(empty.channels.is_empty() && empty.users.is_empty());
+        assert_eq!(empty.stamps, [0; 3]);
+        assert!(empty.channels.is_empty() && empty.users.is_empty() && empty.ims.is_empty());
+    }
+
+    #[test]
+    fn cache_freshness_is_per_directory_and_reads_the_old_layout() {
+        let old = json!({
+            "fetched": 1000,
+            "channels": [{"id": "C01ABCDEF", "name": "dev"}],
+            "users": [{"id": "U01ABCDEF", "name": "alice"}]
+        });
+        let m = Maps::from_json(&old);
+        assert_eq!(m.stamps, [1000, 1000, 0]);
+        assert_eq!(m.channels[0].name, "dev");
+        assert_eq!(m.users[0].name, "alice");
+        let now = 1000 + CACHE_TTL_SECS - 1;
+        assert!(m.is_fresh(Dir::Channels, now));
+        assert!(m.is_fresh(Dir::Users, now));
+        assert!(!m.is_fresh(Dir::Ims, now));
+        assert!(!m.is_fresh(Dir::Channels, 1000 + CACHE_TTL_SECS));
+        assert_eq!(CACHE_TTL_SECS, 3600);
     }
 
     #[test]
@@ -3242,7 +3634,7 @@ mod tests {
     }
 
     #[test]
-    fn message_with_ts_prefers_exact_match() {
+    fn message_with_ts_never_falls_back_to_another_message() {
         let v = json!({"messages": [
             {"ts": "1700000000.000100", "files": [{"id": "F1"}]},
             {"ts": "1700000000.000200", "files": [{"id": "F2"}]}
@@ -3251,11 +3643,328 @@ mod tests {
             message_with_ts(&v, "1700000000.000200").unwrap()["files"][0]["id"],
             "F2"
         );
-        assert_eq!(
-            message_with_ts(&v, "1700000000.000999").unwrap()["files"][0]["id"],
-            "F1"
-        );
+        let parent_only =
+            json!({"messages": [{"ts": "1700000000.000100", "files": [{"id": "F1"}]}]});
+        assert!(message_with_ts(&parent_only, "1700000050.000200").is_none());
         assert!(message_with_ts(&json!({"messages": []}), "x").is_none());
         assert!(message_with_ts(&json!({}), "x").is_none());
+    }
+
+    fn http_ok(body: &str) -> String {
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    fn test_client(base: &str, cache: &std::path::Path) -> Client {
+        let mut c = Client::new("xoxp-t".into(), None, "w".into()).unwrap();
+        c.api_override = Some(format!("{base}/api"));
+        c.cache_dir = Some(cache.to_path_buf());
+        c
+    }
+
+    #[test]
+    fn sanitize_display_escapes_terminal_controls() {
+        assert!(matches!(
+            sanitize_display("plain\ttext\nnext"),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        assert_eq!(sanitize_display("a\u{1b}[2Kb"), "a\\x1b[2Kb");
+        assert_eq!(
+            sanitize_display("\u{1b}]52;c;aGk=\u{7}"),
+            "\\x1b]52;c;aGk=\\x07"
+        );
+        assert_eq!(sanitize_display("x\u{9b}31m\u{7f}"), "x\\x9b31m\\x7f");
+        assert_eq!(
+            sanitize_display("ab\u{202e}cd\u{2066}"),
+            "ab\\u{202e}cd\\u{2066}"
+        );
+        assert_eq!(
+            sanitize_display("line\r\nnext\rover"),
+            "line\nnext\\x0dover"
+        );
+        let m = json!({"ts": "1.2", "user": "U1", "text": "hi\u{1b}]8;;https://evil\u{7}x"});
+        assert_eq!(
+            sanitize_display(&message_line(&m)),
+            "1.2\tU1\thi\\x1b]8;;https://evil\\x07x"
+        );
+    }
+
+    #[test]
+    fn tabs_and_carriage_returns_never_split_a_record() {
+        let m = json!({"ts": "1.2", "user": "U1", "text": "a\tb\r\nc"});
+        let line = message_line(&m);
+        assert_eq!(line, "1.2\tU1\ta b  c");
+        assert_eq!(line.matches('\t').count(), 2);
+        assert_eq!(flatten("x\ty\rz\n"), "x y z ");
+        let a = json!({"title": "T\tx", "title_link": "https://l", "text": "p\tq", "fields": [{"title": "k\t", "value": "v\r"}]});
+        assert_eq!(attachment_text(&a), "T x\thttps://l | p q | k : v");
+        let b = json!({"blocks": [{"type": "section", "text": {"text": "c\td"}}]});
+        assert_eq!(blocks_text(&b), "c d");
+    }
+
+    #[test]
+    fn api_calls_time_out_instead_of_hanging() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            let held = listener.accept();
+            std::thread::sleep(std::time::Duration::from_secs(3));
+            drop(held);
+        });
+        let dir = scratch_dir("timeout");
+        let mut c = test_client(&base, &dir);
+        c.api_timeout = std::time::Duration::from_millis(300);
+        c.api = api_agent(c.api_timeout);
+        let started = std::time::Instant::now();
+        let err = c.call("chat.postMessage", &[]).unwrap_err().to_string();
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert!(
+            err.starts_with("chat.postMessage: timed out after 0.3s"),
+            "{err}"
+        );
+        assert_eq!(API_TIMEOUT, std::time::Duration::from_secs(60));
+    }
+
+    #[test]
+    fn rate_limited_file_transfers_exit_3_with_retry_after() {
+        let resp = "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 7\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string();
+        let (base, _rx, h) = http_server(vec![resp]);
+        let err = fetch_file(
+            &file_agent(TRANSFER_STALL_TIMEOUT),
+            &format!("{base}/f"),
+            None,
+        )
+        .unwrap_err();
+        h.join().unwrap();
+        assert_eq!(exit_code(&err), EXIT_RATE_LIMITED);
+        assert!(err.to_string().contains("retry after 7s"), "{err}");
+    }
+
+    #[test]
+    fn read_tier_finds_existing_dm_without_opening_one() {
+        let dir = scratch_dir("ims");
+        let ims = r#"{"ok":true,"channels":[{"id":"D0123ABCD","user":"U0123ABCD"}]}"#;
+        let (base, rx, h) = http_server(vec![http_ok(ims)]);
+        let c = test_client(&base, &dir);
+        assert_eq!(c.resolve_channel("@U0123ABCD", false).unwrap(), "D0123ABCD");
+        h.join().unwrap();
+        let reqs: Vec<String> = rx.try_iter().collect();
+        assert_eq!(reqs.len(), 1);
+        assert!(
+            reqs[0].starts_with("POST /api/conversations.list "),
+            "{}",
+            reqs[0]
+        );
+        assert!(reqs[0].contains("types=im"), "{}", reqs[0]);
+
+        let (base, rx, h) = http_server(vec![]);
+        let c = test_client(&base, &dir);
+        assert_eq!(c.existing_dm("U0123ABCD", "@alice").unwrap(), "D0123ABCD");
+        let err = c.existing_dm("U0999ZZZZ", "@bob");
+        h.join().unwrap();
+        assert!(err.is_err());
+        assert_eq!(rx.try_iter().count(), 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn missing_dm_refetches_once_then_errors() {
+        let dir = scratch_dir("noim");
+        let (base, rx, h) = http_server(vec![http_ok(r#"{"ok":true,"channels":[]}"#)]);
+        let c = test_client(&base, &dir);
+        let err = c
+            .existing_dm("U0123ABCD", "@alice")
+            .unwrap_err()
+            .to_string();
+        h.join().unwrap();
+        assert_eq!(err, "no DM with @alice (read commands never open one)");
+        assert_eq!(rx.try_iter().count(), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn lookups_refresh_only_the_needed_directory_on_a_miss() {
+        let dir = scratch_dir("lookup");
+        let seed = Maps {
+            stamps: [now_secs(), now_secs(), 0],
+            channels: vec![Chan {
+                id: "C01ABCDEF".into(),
+                name: "dev".into(),
+            }],
+            users: vec![],
+            ims: vec![],
+        };
+        let (base, rx, h) = http_server(vec![http_ok(
+            r#"{"ok":true,"channels":[{"id":"C02ABCDEF","name":"ops"}]}"#,
+        )]);
+        let c = test_client(&base, &dir);
+        c.save_maps(&seed).unwrap();
+        assert_eq!(c.resolve_channel("#dev", false).unwrap(), "C01ABCDEF");
+        assert_eq!(rx.try_iter().count(), 0);
+        assert_eq!(c.resolve_channel("#ops", false).unwrap(), "C02ABCDEF");
+        h.join().unwrap();
+        let reqs: Vec<String> = rx.try_iter().collect();
+        assert_eq!(reqs.len(), 1);
+        assert!(
+            reqs[0].contains("types=public_channel%2Cprivate_channel"),
+            "{}",
+            reqs[0]
+        );
+        assert!(reqs[0].contains("limit=1000"), "{}", reqs[0]);
+        let cached = c.load_maps().unwrap();
+        assert_eq!(cached.channels.len(), 1);
+        assert!(cached.is_fresh(Dir::Users, now_secs()));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn files_on_a_thread_reply_use_the_reply_not_the_parent() {
+        let dir = scratch_dir("reply");
+        let parent = r#"{"ts":"1700000000.000100","files":[{"id":"F1"}]}"#;
+        let reply = r#"{"ts":"1700000050.000200","files":[{"id":"F2"}]}"#;
+        let (base, rx, h) = http_server(vec![
+            http_ok(&format!(r#"{{"ok":true,"messages":[{parent}]}}"#)),
+            http_ok(&format!(r#"{{"ok":true,"messages":[{parent},{reply}]}}"#)),
+            http_ok(&format!(r#"{{"ok":true,"messages":[{parent}]}}"#)),
+            http_ok(&format!(r#"{{"ok":true,"messages":[{parent}]}}"#)),
+        ]);
+        let c = test_client(&base, &dir);
+        let m = c.message("C0123ABCD", "1700000050.000200").unwrap();
+        assert_eq!(m["files"][0]["id"], "F2");
+        let err = c.message("C0123ABCD", "1700000050.000300").unwrap_err();
+        h.join().unwrap();
+        assert_eq!(err.to_string(), "message 1700000050.000300 not found");
+        let reqs: Vec<String> = rx.try_iter().collect();
+        assert!(reqs[0].contains("conversations.history") && reqs[0].contains("inclusive=true"));
+        assert!(reqs[1].contains("conversations.replies") && !reqs[1].contains("limit=1&"));
+    }
+
+    #[test]
+    fn send_text_is_escaped_but_mentions_and_links_stay_live() {
+        let esc = |t: &str| escape_mrkdwn(t, false);
+        assert_eq!(esc("if a<b and c>d").0, "if a&lt;b and c&gt;d");
+        assert_eq!(esc("Vec<String> & co").0, "Vec&lt;String&gt; &amp; co");
+        assert_eq!(esc("AT&amp;T &lt;x&gt;").0, "AT&amp;T &lt;x&gt;");
+        assert_eq!(
+            esc("hi <@U0123ABCD> in <#C0123ABCD|dev> see <https://x.y/a?b=1|docs> <mailto:a@b.c>")
+                .0,
+            "hi <@U0123ABCD> in <#C0123ABCD|dev> see <https://x.y/a?b=1|docs> <mailto:a@b.c>"
+        );
+        assert_eq!(
+            esc("<@alice> <#general> <foo bar>").0,
+            "&lt;@alice&gt; &lt;#general&gt; &lt;foo bar&gt;"
+        );
+        let (t, n) = esc("FYI: <!here> db is down <!channel|channel> <!subteam^S1> <!everyone>");
+        assert_eq!(
+            t,
+            "FYI: &lt;!here&gt; db is down &lt;!channel|channel&gt; &lt;!subteam^S1&gt; &lt;!everyone&gt;"
+        );
+        assert_eq!(
+            n,
+            [
+                "<!here>",
+                "<!channel|channel>",
+                "<!subteam^S1>",
+                "<!everyone>"
+            ]
+        );
+        let (t, n) = escape_mrkdwn("<!here> go", true);
+        assert_eq!((t.as_str(), n.len()), ("<!here> go", 0));
+        assert_eq!(
+            esc("<!date^1392734382^{date}|Feb 18>").0,
+            "<!date^1392734382^{date}|Feb 18>"
+        );
+        assert_eq!(esc("a < <@U0123ABCD> >").0, "a &lt; <@U0123ABCD> &gt;");
+        assert_eq!(esc("<<https://x.y>>").0, "&lt;<https://x.y>&gt;");
+        assert_eq!(esc("plain").0, "plain");
+
+        let cli = Cli::try_parse_from(["scli", "write", "send", "#c", "<!here>", "--raw"]).unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Cmd::Write(WriteCmd::Send {
+                raw: true,
+                allow_broadcast: false,
+                ..
+            })
+        ));
+        let cli =
+            Cli::try_parse_from(["scli", "write", "send", "#c", "x", "--allow-broadcast"]).unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Cmd::Write(WriteCmd::Send {
+                raw: false,
+                allow_broadcast: true,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn text_arguments_may_start_with_a_hyphen() {
+        let send = |args: &[&str]| match Cli::try_parse_from(args).unwrap().cmd {
+            Cmd::Write(WriteCmd::Send {
+                text, thread, file, ..
+            }) => (text, thread, file),
+            _ => panic!("expected write send"),
+        };
+        assert_eq!(
+            send(&["scli", "write", "send", "#c", "- item"])
+                .0
+                .as_deref(),
+            Some("- item")
+        );
+        assert_eq!(
+            send(&["scli", "write", "send", "#c", "-1 on this"])
+                .0
+                .as_deref(),
+            Some("-1 on this")
+        );
+        assert_eq!(
+            send(&["scli", "write", "send", "#c", "-"]).0.as_deref(),
+            Some("-")
+        );
+        let (text, thread, file) = send(&[
+            "scli", "write", "send", "#c", "--thread", "1.2", "-f", "a.txt", "- x",
+        ]);
+        assert_eq!(
+            (text.as_deref(), thread.as_deref()),
+            (Some("- x"), Some("1.2"))
+        );
+        assert_eq!(file, [PathBuf::from("a.txt")]);
+        let (text, thread, _) = send(&["scli", "write", "send", "#c", "--thread", "1.2"]);
+        assert_eq!((text, thread.as_deref()), (None, Some("1.2")));
+        let (text, thread, _) = send(&["scli", "write", "send", "#c", "hi", "--thread", "1.2"]);
+        assert_eq!(
+            (text.as_deref(), thread.as_deref()),
+            (Some("hi"), Some("1.2"))
+        );
+        let cli = Cli::try_parse_from(["scli", "write", "send", "#c", "--json", "-x"]).unwrap();
+        assert!(cli.json);
+        match Cli::try_parse_from(["scli", "read", "draft", "#c", "-1"])
+            .unwrap()
+            .cmd
+        {
+            Cmd::Read(ReadCmd::Draft { text, .. }) => assert_eq!(text.as_deref(), Some("-1")),
+            _ => panic!("expected read draft"),
+        }
+        match Cli::try_parse_from([
+            "scli",
+            "write",
+            "remind",
+            "add",
+            "- stretch",
+            "--at",
+            "in 5 minutes",
+        ])
+        .unwrap()
+        .cmd
+        {
+            Cmd::Write(WriteCmd::Remind(Remind::Add { text, at })) => {
+                assert_eq!((text.as_str(), at.as_str()), ("- stretch", "in 5 minutes"))
+            }
+            _ => panic!("expected remind add"),
+        }
     }
 }

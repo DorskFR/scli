@@ -60,7 +60,7 @@ scli write send '#release' 'logs attached' -f build.log
 scli read messages '#general' -l 50 --json | jq -r 'select(.thread_ts) | .ts'
 ```
 
-`<channel>` is an ID, `#name` or `@user` (DM). Text arguments read stdin when omitted or `-`.
+`<channel>` is an ID, `#name` or `@user` (DM). Text arguments read stdin when omitted or `-`. `write send` escapes `& < >` and keeps `<!here>`-style broadcasts as plain text unless `--allow-broadcast`; `--raw` sends Slack markup verbatim.
 
 ### Output
 
